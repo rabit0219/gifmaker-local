@@ -1138,7 +1138,7 @@ var st = {
   start: 0, end: 0,
   cropMode: 'off', ratio: 0, crop: { x: 0, y: 0, w: 1, h: 1 },
   frames: [],            // { img: ImageData, delay: ms }
-  w: 0, h: 0, base: 100, dropped: 0,
+  w: 0, h: 0, base: 100, dropped: 0, busy: false,
   mode: 'normal',
   cache: {}
 };
@@ -1179,6 +1179,12 @@ function download(blob, filename) {
 }
 function stale(on) {
   $('resHint').textContent = on && st.frames.length ? '— 설정이 바뀌었습니다. [움짤 만들기]를 다시 누르세요' : '';
+}
+function setBusy(on) {
+  st.busy = on;
+  $('btnMake').disabled = on;
+  $('btnGif').disabled = on;
+  $('btnVid').disabled = on;
 }
 
 /* ---------- 설정 저장/복원 ---------- */
@@ -1534,7 +1540,9 @@ function sameImg(a, b) {
 async function make() {
   showErr('');
   var btn = $('btnMake');
-  btn.disabled = true;
+  /* 추출 중에는 저장을 막는다. 이전 결과가 화면에 남아 있으면 저장 버튼을
+     누를 수 있고, 그러면 절반만 채워진 프레임으로 인코딩된다. */
+  setBusy(true);
   stopPreview();
   st.cache = {};
   $('outNote').textContent = '';
@@ -1573,11 +1581,11 @@ async function make() {
     }
   } catch (e) {
     showErr('프레임 추출 실패: ' + (e && e.message ? e.message : e));
-    btn.disabled = false; $('prog').hidden = true;
+    setBusy(false); $('prog').hidden = true;
     return;
   }
   $('prog').hidden = true;
-  btn.disabled = false;
+  setBusy(false);
   if (!st.frames.length) { showErr('프레임을 얻지 못했습니다.'); return; }
   $('resultCard').hidden = false;
   startPreview();
@@ -1704,6 +1712,7 @@ function ditherFS(img, pal) {
 $('btnGif').addEventListener('click', function () { exportGif(); });
 
 async function exportGif() {
+  if (st.busy) { showErr('프레임 추출이 끝난 뒤에 저장해 주세요.'); return; }
   if (!st.frames.length) return;
   var colors = +$('selColors').value, dith = $('selDither').value;
   var key = 'gif|' + st.mode + '|' + colors + '|' + dith;
@@ -1773,6 +1782,7 @@ function pickMime() {
 $('btnVid').addEventListener('click', function () { exportVideo(); });
 
 function exportVideo() {
+  if (st.busy) { showErr('프레임 추출이 끝난 뒤에 저장해 주세요.'); return; }
   if (!st.frames.length) return;
   var mime = pickMime();
   if (!mime) { showErr('이 브라우저는 동영상 녹화(MediaRecorder)를 지원하지 않습니다. GIF로 저장해 주세요.'); return; }
