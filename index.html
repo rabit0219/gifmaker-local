@@ -140,6 +140,10 @@ select:focus { outline: none; border-color: #4c8dff; }
 .chip { background: #22262f; border-radius: 20px; padding: 5px 12px; font-size: 12px; color: #a8b0bd; }
 .chip b { color: #e6e8ec; }
 .note { font-size: 11.5px; color: #6b7280; margin-top: 12px; line-height: 1.6; }
+#outActions { margin-top: 16px; padding-top: 14px; border-top: 1px solid #262a33; }
+.done-file { font-size: 13px; color: #a8b0bd; margin-bottom: 10px; text-align: center; }
+.done-file b { color: #e6e8ec; }
+.done-file .ok { color: #4ade80; margin-right: 5px; }
 .err { color: #ff6b6b; font-size: 12.5px; margin-top: 10px; }
 </style>
 </head>
@@ -304,6 +308,22 @@ select:focus { outline: none; border-color: #4c8dff; }
         <div class="prog-bar"><i id="progBar2"></i></div>
         <div class="prog-txt" id="progTxt2"></div>
       </div>
+
+      <div id="outActions" hidden>
+        <div class="done-file" id="outFile"></div>
+        <div class="row">
+          <button class="btn" id="btnShare" hidden>
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8"/><polyline points="16 6 12 2 8 6"/><line x1="12" y1="2" x2="12" y2="15"/>
+            </svg>
+            앨범에 저장 · 공유
+          </button>
+          <button class="btn ghost" id="btnDl">파일로 저장</button>
+          <button class="btn ghost" id="btnSaveAs" hidden>위치 선택해 저장</button>
+        </div>
+        <p class="note" id="shareHint"></p>
+      </div>
+
       <p class="note" id="outNote"></p>
     </div>
   </div>
@@ -1192,10 +1212,16 @@ var st = {
 };
 var timer = null;
 
-/* iOS 는 <a download> 로 파일이 저장되지 않고 새 탭에서 열린다 */
+/* iOS 는 <a download> 로 파일이 저장되지 않고 새 탭에서 열린다.
+   공유 시트를 쓸 수 있으면 그쪽이 정답이라 안내를 바꿔야 한다. */
 var IOS = /iP(hone|od|ad)/.test(navigator.userAgent) ||
   (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-var SAVE_HINT = IOS ? ' iOS는 파일이 새 탭에서 열릴 수 있습니다. 길게 눌러 [사진에 추가]로 저장하세요.' : '';
+/* 공유 시트가 있으면 인코딩 완료 != 저장 완료다 */
+function doneWord() { return SHARE_FILES ? '만들었습니다' : '저장했습니다'; }
+function saveHint() {
+  if (!IOS || SHARE_FILES) return '';
+  return ' iOS는 파일이 새 탭에서 열릴 수 있습니다. 길게 눌러 [사진에 추가]로 저장하세요.';
+}
 
 /* ---------- 유틸 ---------- */
 function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
@@ -1228,6 +1254,74 @@ function download(blob, filename) {
 function stale(on) {
   $('resHint').textContent = on && st.frames.length ? '— 설정이 바뀌었습니다. [움짤 만들기]를 다시 누르세요' : '';
 }
+
+/* ---------- 결과 저장 방식 선택 ----------
+   iOS 는 <a download> 로 파일이 저장되지 않고 새 탭에서 열려 버린다.
+   Web Share API 로 파일을 넘기면 네이티브 공유 시트가 떠서 [이미지 저장]
+   /[비디오 저장] 로 앨범에 바로 넣을 수 있다. 그래서 인코딩이 끝나면
+   바로 내려받지 않고 저장 방법을 고르게 한다. */
+var SHARE_FILES = (function () {
+  try {
+    if (!navigator.share || !navigator.canShare) return false;
+    var probe = new File([new Uint8Array([71, 73, 70, 56, 57, 97])], 'probe.gif', { type: 'image/gif' });
+    return navigator.canShare({ files: [probe] });
+  } catch (e) { return false; }
+})();
+var SAVE_AS = typeof window.showSaveFilePicker === 'function';
+var lastOut = null;
+
+function offerResult(blob, name) {
+  lastOut = { blob: blob, name: name };
+  $('outFile').innerHTML = '<span class="ok">✓</span> <b>' + escapeHtml(name) + '</b> · ' + fmtB(blob.size);
+  $('outActions').hidden = false;
+  $('btnShare').hidden = !SHARE_FILES;
+  $('btnSaveAs').hidden = !SAVE_AS;
+  $('btnDl').className = SHARE_FILES ? 'btn ghost' : 'btn';
+  var ext = name.split('.').pop().toLowerCase();
+  $('shareHint').textContent = !SHARE_FILES ? '' :
+    (ext === 'webp'
+      ? '앨범 저장은 GIF·동영상에서 가장 확실합니다. WebP는 기기에 따라 공유 시트에 [파일에 저장]만 나올 수 있습니다.'
+      : '공유 시트에서 [이미지 저장] 또는 [비디오 저장]을 고르면 앨범에 들어갑니다.');
+  /* 공유가 안 되는 환경(대부분의 데스크톱)은 지금까지처럼 바로 내려받는다 */
+  if (!SHARE_FILES) download(blob, name);
+  $('outActions').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+$('btnDl').addEventListener('click', function () {
+  if (lastOut) download(lastOut.blob, lastOut.name);
+});
+/* share()/showSaveFilePicker() 는 사용자 제스처 안에서 곧바로 불러야 한다.
+   그래서 이 핸들러에서는 인코딩을 하지 않고 만들어 둔 blob 만 넘긴다. */
+$('btnShare').addEventListener('click', function () {
+  if (!lastOut) return;
+  var f;
+  try {
+    f = new File([lastOut.blob], lastOut.name, { type: lastOut.blob.type });
+  } catch (e) {
+    showErr('파일을 만들지 못했습니다: ' + e.message);
+    return;
+  }
+  navigator.share({ files: [f] }).catch(function (e) {
+    if (e && e.name === 'AbortError') return;          // 사용자가 취소
+    showErr('공유하지 못했습니다: ' + (e && e.message ? e.message : e));
+  });
+});
+$('btnSaveAs').addEventListener('click', function () {
+  if (!lastOut) return;
+  window.showSaveFilePicker({
+    suggestedName: lastOut.name,
+    types: [{ description: '움짤', accept: (function () {
+      var a = {}; a[lastOut.blob.type || 'application/octet-stream'] = ['.' + lastOut.name.split('.').pop()]; return a;
+    })() }]
+  }).then(function (h) {
+    return h.createWritable().then(function (w) {
+      return w.write(lastOut.blob).then(function () { return w.close(); });
+    });
+  }).catch(function (e) {
+    if (e && e.name === 'AbortError') return;
+    showErr('저장하지 못했습니다: ' + (e && e.message ? e.message : e));
+  });
+});
 function setBusy(on) {
   st.busy = on;
   $('btnMake').disabled = on;
@@ -1271,6 +1365,8 @@ function openFile(f) {
   stopPreview();
   showErr('');
   $('resultCard').hidden = true;
+  $('outActions').hidden = true;
+  lastOut = null;
   clearFrameCache();
   st.frames = []; st.cache = {};
   if (st.url) URL.revokeObjectURL(st.url);
@@ -1672,6 +1768,8 @@ async function make() {
   clearFrameCache();
   st.cache = {};
   $('outNote').textContent = '';
+  $('outActions').hidden = true;
+  lastOut = null;
   stale(false);
   cancelFlag = false;
   var cb = $('btnCancel');
@@ -2020,7 +2118,7 @@ async function exportWebp() {
   if (!WEBP_OK) { showErr('이 브라우저는 WebP 인코딩을 지원하지 않습니다.'); return; }
   var q = +$('selWq').value;
   var key = 'webp|' + st.mode + '|' + q;
-  if (st.cache[key]) { download(st.cache[key], outName('webp')); return; }
+  if (st.cache[key]) { offerResult(st.cache[key], outName('webp')); return; }
 
   var bs = [$('btnWebp'), $('btnGif'), $('btnVid')];
   bs.forEach(function (b) { b.disabled = true; });
@@ -2097,11 +2195,11 @@ async function exportWebp() {
     $('prog2').hidden = true;
     renderChips();
     var pct = Math.round(saved / (st.w * st.h * seq.length) * 100);
-    $('outNote').textContent = 'WebP ' + fmtB(wblob.size) + ' 저장했습니다.' +
+    $('outNote').textContent = 'WebP ' + fmtB(wblob.size) + ' ' + doneWord() + '.' +
       (pct > 0 ? ' 바뀐 영역만 인코딩해 픽셀 ' + pct + '%를 덜 담았습니다.' : '') +
       (st.sizes.GIF ? ' 같은 움짤 GIF는 ' + fmtB(st.sizes.GIF) + '였습니다.' : '') +
-      SAVE_HINT;
-    download(wblob, outName('webp'));
+      saveHint();
+    offerResult(wblob, outName('webp'));
   } catch (e) {
     $('prog2').hidden = true;
     showErr('WebP 인코딩 실패: ' + (e && e.message ? e.message : e));
@@ -2118,7 +2216,7 @@ async function exportGif() {
   if (!st.frames.length) return;
   var colors = +$('selColors').value, dith = $('selDither').value;
   var key = 'gif|' + st.mode + '|' + colors + '|' + dith;
-  if (st.cache[key]) { download(st.cache[key], outName('gif')); return; }
+  if (st.cache[key]) { offerResult(st.cache[key], outName('gif')); return; }
 
   var b1 = $('btnGif'), b2 = $('btnVid');
   b1.disabled = b2.disabled = true;
@@ -2157,8 +2255,8 @@ async function exportGif() {
     $('prog2').hidden = true;
     st.sizes.GIF = blob.size; renderChips();
     $('outNote').textContent = 'GIF ' + fmtB(blob.size) +
-      ' 저장했습니다. 용량이 크면 가로 크기 · fps · 색상 수를 낮춰 보세요.' + SAVE_HINT;
-    download(blob, outName('gif'));
+      ' ' + doneWord() + '. 용량이 크면 가로 크기 · fps · 색상 수를 낮춰 보세요.' + saveHint();
+    offerResult(blob, outName('gif'));
   } catch (e) {
     $('prog2').hidden = true;
     showErr('GIF 인코딩 실패: ' + (e && e.message ? e.message : e));
@@ -2232,8 +2330,8 @@ async function exportVideo() {
     b1.disabled = b2.disabled = false;
     st.sizes[ext.toUpperCase()] = blob.size; renderChips();
     $('outNote').textContent = ext.toUpperCase() + ' ' + fmtB(blob.size) +
-      ' 저장했습니다. GIF보다 훨씬 작지만, 자동 반복 재생은 보는 쪽 플레이어에 따라 다릅니다.' + SAVE_HINT;
-    download(blob, outName(ext));
+      ' ' + doneWord() + '. GIF보다 훨씬 작지만, 자동 반복 재생은 보는 쪽 플레이어에 따라 다릅니다.' + saveHint();
+    offerResult(blob, outName(ext));
   };
 
   rec.start();
