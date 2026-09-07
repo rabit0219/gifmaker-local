@@ -256,6 +256,14 @@ select:focus { outline: none; border-color: #4c8dff; }
             <option value="none">없음</option>
           </select>
         </label>
+        <label class="f"><span>화질 (WebP)</span>
+          <select id="selWq">
+            <option value="0.6">60% (아주 작게)</option>
+            <option value="0.75">75%</option>
+            <option value="0.85" selected>85% (권장)</option>
+            <option value="0.95">95% (고화질)</option>
+          </select>
+        </label>
       </div>
       <div class="est" id="est"></div>
       <div class="prog" id="prog" hidden>
@@ -280,9 +288,15 @@ select:focus { outline: none; border-color: #4c8dff; }
           <button data-v="boomerang">부메랑 재생</button>
         </div>
         <div class="row">
-          <button class="btn" id="btnGif">GIF로 저장</button>
+          <button class="btn" id="btnWebp">WebP로 저장</button>
+          <button class="btn ghost" id="btnGif">GIF로 저장</button>
           <button class="btn ghost" id="btnVid">동영상으로 저장</button>
         </div>
+        <p class="note" style="margin-top:10px">
+          <b style="color:#a8b0bd">WebP</b>가 대체로 가장 작고 (GIF의 1/3~1/10), 이미지라서 GIF처럼 그대로 붙습니다.
+          <b style="color:#a8b0bd">GIF</b>는 호환성이 필요할 때 (카톡·구형 커뮤니티).
+          움직임이 많고 긴 영상은 <b style="color:#a8b0bd">동영상</b>이 더 작을 수 있으니, 저장해 보고 위 용량을 비교하세요.
+        </p>
       </div>
       <div class="prog" id="prog2" hidden>
         <div class="prog-bar"><i id="progBar2"></i></div>
@@ -1138,7 +1152,7 @@ var st = {
   start: 0, end: 0,
   cropMode: 'off', ratio: 0, crop: { x: 0, y: 0, w: 1, h: 1 },
   frames: [],            // { img: ImageData, delay: ms }
-  w: 0, h: 0, base: 100, dropped: 0, busy: false,
+  w: 0, h: 0, base: 100, dropped: 0, busy: false, sizes: {},
   mode: 'normal',
   cache: {}
 };
@@ -1185,10 +1199,11 @@ function setBusy(on) {
   $('btnMake').disabled = on;
   $('btnGif').disabled = on;
   $('btnVid').disabled = on;
+  $('btnWebp').disabled = on || !WEBP_OK;
 }
 
 /* ---------- 설정 저장/복원 ---------- */
-var FIELDS = ['selSpeed', 'selW', 'selFps', 'selColors', 'selDither'];
+var FIELDS = ['selSpeed', 'selW', 'selFps', 'selColors', 'selDither', 'selWq'];
 function loadSettings() {
   try {
     var s = JSON.parse(localStorage.getItem(LS) || '{}');
@@ -1549,7 +1564,7 @@ async function make() {
   stale(false);
 
   var p = plan(), c = cropPx();
-  st.w = p.w; st.h = p.h; st.base = p.delay; st.dropped = 0;
+  st.w = p.w; st.h = p.h; st.base = p.delay; st.dropped = 0; st.sizes = {};
 
   var cv = document.createElement('canvas');
   cv.width = p.w; cv.height = p.h;
@@ -1597,17 +1612,21 @@ function setProg(id, ratio, txt) {
   $(id === 'prog' ? 'progTxt' : 'progTxt2').textContent = txt;
 }
 
-function renderChips(extra) {
+/* 저장한 포맷들의 용량을 나란히 보여준다 (포맷 비교가 이 앱의 핵심 판단 재료) */
+function renderChips() {
   var seq = seqOf(st.frames.length);
   var ms = totalMs(seq);
-  $('chips').innerHTML =
+  var html =
     '<span class="chip">프레임 <b>' + st.frames.length + '</b></span>' +
     '<span class="chip">재생 프레임 <b>' + seq.length + '</b></span>' +
     '<span class="chip">크기 <b>' + st.w + '×' + st.h + '</b></span>' +
     '<span class="chip">재생 <b>' + (ms / 1000).toFixed(2) + 's</b></span>' +
     '<span class="chip">배속 <b>' + $('selSpeed').value + 'x</b></span>' +
-    (st.dropped ? '<span class="chip">중복 병합 <b>' + st.dropped + '</b></span>' : '') +
-    (extra || '');
+    (st.dropped ? '<span class="chip">중복 병합 <b>' + st.dropped + '</b></span>' : '');
+  ['WEBP', 'GIF', 'MP4', 'WEBM'].forEach(function (k) {
+    if (st.sizes[k]) html += '<span class="chip">' + k + ' <b>' + fmtB(st.sizes[k]) + '</b></span>';
+  });
+  $('chips').innerHTML = html;
 }
 
 /* ---------- 미리보기 ---------- */
@@ -1708,6 +1727,171 @@ function ditherFS(img, pal) {
   return index;
 }
 
+/* ================= 애니메이션 WebP =================
+   브라우저에는 애니메이션 WebP 인코더가 없다. 대신 프레임마다
+   canvas.toBlob('image/webp') 로 정지 WebP 를 만들고, 그 안의 VP8
+   비트스트림 청크를 꺼내 RIFF/ANMF 컨테이너로 직접 이어 붙인다.
+   프레임마다 바뀐 영역(dirty rect)만 인코딩해 용량을 더 줄인다. */
+
+var WEBP_OK = (function () {
+  try {
+    var c = document.createElement('canvas');
+    c.width = c.height = 2;
+    return c.toDataURL('image/webp').indexOf('data:image/webp') === 0;
+  } catch (e) { return false; }
+})();
+
+function u16(v) { return [v & 255, (v >> 8) & 255]; }
+function u24(v) { return [v & 255, (v >> 8) & 255, (v >> 16) & 255]; }
+function u32(v) { return [v & 255, (v >>> 8) & 255, (v >>> 16) & 255, (v >>> 24) & 255]; }
+function fourcc(s) { return [s.charCodeAt(0), s.charCodeAt(1), s.charCodeAt(2), s.charCodeAt(3)]; }
+
+/* RIFF 청크 하나 만들기 (홀수 크기는 1바이트 패딩) */
+function riffChunk(tag, payload) {
+  var pad = payload.length & 1;
+  var out = new Uint8Array(8 + payload.length + pad);
+  out.set(fourcc(tag), 0);
+  out.set(u32(payload.length), 4);
+  out.set(payload, 8);
+  return out;
+}
+function concatBytes(list) {
+  var n = 0, i;
+  for (i = 0; i < list.length; i++) n += list[i].length;
+  var out = new Uint8Array(n), o = 0;
+  for (i = 0; i < list.length; i++) { out.set(list[i], o); o += list[i].length; }
+  return out;
+}
+
+/* 정지 WebP 에서 ALPH / VP8 / VP8L 청크만(헤더 포함) 뽑아낸다 */
+function webpBitstream(buf) {
+  if (String.fromCharCode(buf[0], buf[1], buf[2], buf[3]) !== 'RIFF' ||
+      String.fromCharCode(buf[8], buf[9], buf[10], buf[11]) !== 'WEBP') {
+    throw new Error('정지 WebP 형식이 아닙니다');
+  }
+  var dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  var out = [], alpha = false, pos = 12;
+  while (pos + 8 <= buf.length) {
+    var tag = String.fromCharCode(buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]);
+    var size = dv.getUint32(pos + 4, true);
+    var whole = 8 + size + (size & 1);
+    if (tag === 'ALPH' || tag === 'VP8 ' || tag === 'VP8L') {
+      out.push(buf.subarray(pos, pos + whole));
+      if (tag === 'ALPH') alpha = true;
+    }
+    pos += whole;
+  }
+  if (!out.length) throw new Error('VP8 비트스트림을 찾지 못했습니다');
+  return { chunks: out, alpha: alpha };
+}
+
+/* 두 프레임에서 달라진 픽셀의 바운딩 박스. ANMF 의 x/y 는 2픽셀 단위라 짝수로 맞춘다 */
+function dirtyRect(a, b) {
+  var w = st.w, h = st.h, da = a.data, db = b.data;
+  var minX = w, minY = h, maxX = -1, maxY = -1, x, y, o;
+  for (y = 0; y < h; y++) {
+    var row = y * w * 4;
+    for (x = 0; x < w; x++) {
+      o = row + x * 4;
+      if (da[o] !== db[o] || da[o + 1] !== db[o + 1] || da[o + 2] !== db[o + 2]) {
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+  if (maxX < 0) return { x: 0, y: 0, w: 2, h: 2 };   // 완전히 동일한 경우
+  minX &= ~1; minY &= ~1;
+  return { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 };
+}
+
+$('btnWebp').addEventListener('click', function () { exportWebp(); });
+
+async function exportWebp() {
+  if (st.busy) { showErr('프레임 추출이 끝난 뒤에 저장해 주세요.'); return; }
+  if (!st.frames.length) return;
+  if (!WEBP_OK) { showErr('이 브라우저는 WebP 인코딩을 지원하지 않습니다.'); return; }
+  var q = +$('selWq').value;
+  var key = 'webp|' + st.mode + '|' + q;
+  if (st.cache[key]) { download(st.cache[key], outName('webp')); return; }
+
+  var bs = [$('btnWebp'), $('btnGif'), $('btnVid')];
+  bs.forEach(function (b) { b.disabled = true; });
+  $('prog2').hidden = false;
+  setProg('prog2', 0.02, 'WebP 인코딩 준비...');
+  await tick();
+
+  try {
+    var seq = seqOf(st.frames.length);
+    var full = document.createElement('canvas');
+    full.width = st.w; full.height = st.h;
+    var fctx = full.getContext('2d', { alpha: false });
+    var sub = document.createElement('canvas');
+    var sctx = sub.getContext('2d', { alpha: false });
+
+    var anmf = [], anyAlpha = false, saved = 0;
+    for (var k = 0; k < seq.length; k++) {
+      var f = st.frames[seq[k]];
+      var r = k === 0 ? { x: 0, y: 0, w: st.w, h: st.h }
+                      : dirtyRect(st.frames[seq[k - 1]].img, f.img);
+      saved += (st.w * st.h - r.w * r.h);
+
+      fctx.putImageData(f.img, 0, 0);
+      sub.width = r.w; sub.height = r.h;
+      sctx.drawImage(full, r.x, r.y, r.w, r.h, 0, 0, r.w, r.h);
+
+      var blob = await new Promise(function (res) { sub.toBlob(res, 'image/webp', q); });
+      if (!blob) throw new Error('WebP 프레임 인코딩에 실패했습니다');
+      var got = webpBitstream(new Uint8Array(await blob.arrayBuffer()));
+      if (got.alpha) anyAlpha = true;
+
+      var head = new Uint8Array(16);
+      head.set(u24(r.x >> 1), 0);
+      head.set(u24(r.y >> 1), 3);
+      head.set(u24(r.w - 1), 6);
+      head.set(u24(r.h - 1), 9);
+      head.set(u24(f.delay), 12);
+      head[15] = 0x02;                       // B=1 블렌딩 안 함, D=0 폐기 안 함
+      anmf.push(riffChunk('ANMF', concatBytes([head].concat(got.chunks))));
+
+      setProg('prog2', (k + 1) / seq.length, 'WebP 인코딩 ' + (k + 1) + ' / ' + seq.length);
+      if (k % 2 === 0) await tick();
+    }
+
+    var vp8x = new Uint8Array(10);
+    vp8x[0] = 0x02 | (anyAlpha ? 0x10 : 0);  // Animation (+ Alpha)
+    vp8x.set(u24(st.w - 1), 4);
+    vp8x.set(u24(st.h - 1), 7);
+    var anim = new Uint8Array(6);            // 배경 투명 + 무한 반복
+    anim.set(u16(0), 4);
+
+    var body = concatBytes([riffChunk('VP8X', vp8x), riffChunk('ANIM', anim)].concat(anmf));
+    var out = new Uint8Array(12 + body.length);
+    out.set(fourcc('RIFF'), 0);
+    out.set(u32(4 + body.length), 4);
+    out.set(fourcc('WEBP'), 8);
+    out.set(body, 12);
+
+    var wblob = new Blob([out], { type: 'image/webp' });
+    st.cache[key] = wblob;
+    st.sizes.WEBP = wblob.size;
+    $('prog2').hidden = true;
+    renderChips();
+    var pct = Math.round(saved / (st.w * st.h * seq.length) * 100);
+    $('outNote').textContent = 'WebP ' + fmtB(wblob.size) + ' 저장했습니다.' +
+      (pct > 0 ? ' 바뀐 영역만 인코딩해 픽셀 ' + pct + '%를 덜 담았습니다.' : '') +
+      (st.sizes.GIF ? ' 같은 움짤 GIF는 ' + fmtB(st.sizes.GIF) + '였습니다.' : '') +
+      SAVE_HINT;
+    download(wblob, outName('webp'));
+  } catch (e) {
+    $('prog2').hidden = true;
+    showErr('WebP 인코딩 실패: ' + (e && e.message ? e.message : e));
+  }
+  bs.forEach(function (b) { b.disabled = false; });
+  $('btnWebp').disabled = !WEBP_OK;
+}
+
 /* ---------- GIF 저장 ---------- */
 $('btnGif').addEventListener('click', function () { exportGif(); });
 
@@ -1747,7 +1931,7 @@ async function exportGif() {
     var blob = new Blob([bytes], { type: 'image/gif' });
     st.cache[key] = blob;
     $('prog2').hidden = true;
-    renderChips('<span class="chip">GIF <b>' + fmtB(blob.size) + '</b></span>');
+    st.sizes.GIF = blob.size; renderChips();
     $('outNote').textContent = 'GIF ' + fmtB(blob.size) +
       ' 저장했습니다. 용량이 크면 가로 크기 · fps · 색상 수를 낮춰 보세요.' + SAVE_HINT;
     download(blob, outName('gif'));
@@ -1822,7 +2006,7 @@ function exportVideo() {
     var ext = mime.indexOf('mp4') >= 0 ? 'mp4' : 'webm';
     $('prog2').hidden = true;
     b1.disabled = b2.disabled = false;
-    renderChips('<span class="chip">' + ext.toUpperCase() + ' <b>' + fmtB(blob.size) + '</b></span>');
+    st.sizes[ext.toUpperCase()] = blob.size; renderChips();
     $('outNote').textContent = ext.toUpperCase() + ' ' + fmtB(blob.size) +
       ' 저장했습니다. GIF보다 훨씬 작지만, 자동 반복 재생은 보는 쪽 플레이어에 따라 다릅니다.' + SAVE_HINT;
     download(blob, outName(ext));
@@ -1846,6 +2030,10 @@ function exportVideo() {
 /* ---------- 시작 ---------- */
 loadSettings();
 if (!pickMime()) $('btnVid').title = '이 브라우저는 MediaRecorder를 지원하지 않습니다';
+if (!WEBP_OK) {
+  $('btnWebp').disabled = true;
+  $('btnWebp').title = '이 브라우저는 WebP 인코딩을 지원하지 않습니다';
+}
 window.addEventListener('beforeunload', function () { if (st.url) URL.revokeObjectURL(st.url); });
 
 })();
