@@ -270,8 +270,9 @@ select:focus { outline: none; border-color: #4c8dff; }
         <div class="prog-bar"><i id="progBar"></i></div>
         <div class="prog-txt" id="progTxt"></div>
       </div>
-      <div style="margin-top:14px">
-        <button class="btn wide" id="btnMake">움짤 만들기</button>
+      <div style="margin-top:14px" class="row">
+        <button class="btn" id="btnMake" style="flex:3">움짤 만들기</button>
+        <button class="btn ghost" id="btnCancel" style="flex:1;min-width:100px" hidden>취소</button>
       </div>
       <div class="err" id="err" hidden></div>
     </div>
@@ -1152,8 +1153,8 @@ var st = {
   name: '', url: null, dur: 0, vw: 0, vh: 0, size: 0,
   start: 0, end: 0,
   cropMode: 'off', ratio: 0, crop: { x: 0, y: 0, w: 1, h: 1 },
-  frames: [],            // { img: ImageData, delay: ms }
-  w: 0, h: 0, base: 100, dropped: 0, busy: false, sizes: {},
+  frames: [],            // { blob: 압축 스틸, delay: ms }
+  w: 0, h: 0, base: 100, dropped: 0, busy: false, sizes: {}, stored: 0, truncated: false,
   mode: 'normal',
   cache: {}
 };
@@ -1238,6 +1239,7 @@ function openFile(f) {
   stopPreview();
   showErr('');
   $('resultCard').hidden = true;
+  clearFrameCache();
   st.frames = []; st.cache = {};
   if (st.url) URL.revokeObjectURL(st.url);
   st.url = URL.createObjectURL(f);
@@ -1474,21 +1476,92 @@ function outSize() {
   w -= w % 2; h -= h % 2;
   return { w: Math.max(2, w), h: Math.max(2, h) };
 }
-/* 모바일은 탭 메모리 한도가 훨씬 낮아 예산을 줄인다 */
-function frameCap(w, h) {
-  var coarse = typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches;
-  return Math.max(4, Math.min(coarse ? 150 : 320, Math.floor((coarse ? 70e6 : 160e6) / (w * h * 4))));
+/* ================= 프레임 저장소 =================
+   프레임을 raw RGBA 로 들고 있으면 480x854 기준 1.6MB/장이라 메모리가 금방
+   차고 장수 상한이 생긴다(모바일에서 42장). 그래서 추출하는 즉시 압축 스틸
+   (WebP, 없으면 JPEG)로 바꿔 두고 픽셀이 필요한 순간에만 디코딩한다.
+   같은 크기에서 15~25배 적게 써서 장수 제한이 실질적으로 사라진다. */
+function isCoarse() {
+  return typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches;
 }
+function memBudget() { return isCoarse() ? 120e6 : 320e6; }
+var HARD_MAX = 2000;            // 추출 시간·출력 용량 때문에 두는 절대 상한
+var STORE_Q = 0.94;
+function storeMime() { return WEBP_OK ? 'image/webp' : 'image/jpeg'; }
+
 function plan() {
   var fps = +$('selFps').value, speed = +$('selSpeed').value;
   var s = outSize();
   var span = st.end - st.start;
   var want = Math.max(2, Math.round(span / speed * fps));
-  var cap = frameCap(s.w, s.h);
   return {
     w: s.w, h: s.h, fps: fps, speed: speed, span: span,
-    n: Math.min(want, cap), want: want, cap: cap, delay: baseDelay(fps)
+    n: Math.min(want, HARD_MAX), want: want, delay: baseDelay(fps)
   };
+}
+
+function toBlobAsync(canvas) {
+  return new Promise(function (res, rej) {
+    canvas.toBlob(function (b) {
+      b ? res(b) : rej(new Error('프레임을 이미지로 저장하지 못했습니다'));
+    }, storeMime(), STORE_Q);
+  });
+}
+/* 인접 프레임 중복 판정. 픽셀이 같으면 인코더 출력도 바이트까지 같으므로
+   raw 픽셀을 다시 읽지 않고 인코딩된 바이트를 비교한다. */
+function sameBytes(a, b) {
+  if (a.length !== b.length) return false;
+  var i;
+  for (i = 0; i < a.length; i += 97) if (a[i] !== b[i]) return false;
+  for (i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+var bmpCache = new Map();       // 프레임 인덱스 -> 디코딩된 비트맵 (LRU)
+var BMP_MAX = 12;
+var work = null, wctx = null;
+
+async function decodeBlob(blob) {
+  if (typeof createImageBitmap === 'function') {
+    return { img: await createImageBitmap(blob), url: null };
+  }
+  var url = URL.createObjectURL(blob);        // createImageBitmap 없는 구형 사파리
+  var im = new Image();
+  im.src = url;
+  if (im.decode) await im.decode();
+  else await new Promise(function (r, j) { im.onload = r; im.onerror = j; });
+  return { img: im, url: url };
+}
+function releaseEntry(e) {
+  if (e.img && e.img.close) e.img.close();
+  if (e.url) URL.revokeObjectURL(e.url);
+}
+function clearFrameCache() {
+  bmpCache.forEach(releaseEntry);
+  bmpCache.clear();
+}
+async function frameBitmap(i) {
+  var hit = bmpCache.get(i);
+  if (hit) { bmpCache.delete(i); bmpCache.set(i, hit); return hit.img; }
+  var e = await decodeBlob(st.frames[i].blob);
+  bmpCache.set(i, e);
+  while (bmpCache.size > BMP_MAX) {
+    var k = bmpCache.keys().next().value;
+    var old = bmpCache.get(k);
+    bmpCache.delete(k);
+    releaseEntry(old);
+  }
+  return e.img;
+}
+/* 인코딩용 RGBA. 작업 캔버스 하나를 재사용한다 */
+async function frameData(i) {
+  if (!work) {
+    work = document.createElement('canvas');
+    wctx = work.getContext('2d', { alpha: false, willReadFrequently: true });
+  }
+  if (work.width !== st.w || work.height !== st.h) { work.width = st.w; work.height = st.h; }
+  wctx.drawImage(await frameBitmap(i), 0, 0);
+  return wctx.getImageData(0, 0, st.w, st.h);
 }
 function seqOf(n) {
   var a = [], i;
@@ -1512,8 +1585,13 @@ function renderEst() {
     ' &nbsp;·&nbsp; 재생 <b>' + (out * p.delay / 1000).toFixed(2) + 's</b>' +
     ' &nbsp;·&nbsp; 실제 <b>' + (1000 / p.delay).toFixed(1) + ' fps</b>';
   if (p.speed < 1) msg += '<br>느린 배속은 같은 프레임이 반복될 수 있어, 중복 프레임은 자동으로 하나로 합쳐 표시 시간을 늘립니다.';
-  if (p.want > p.cap) msg += '<br><span class="warn">메모리 한계로 ' + p.cap + '장까지만 추출합니다. 구간·크기·fps를 줄이거나 배속을 올려 주세요.</span>';
-  else if (out > 140) msg += '<br><span class="warn">프레임이 많아 GIF 용량이 커집니다. fps나 구간을 줄이는 걸 권장.</span>';
+  if (p.want > HARD_MAX) {
+    msg += '<br><span class="warn">한 번에 ' + HARD_MAX + '장까지만 추출합니다 (요청 ' + p.want +
+      '장). 구간을 줄이거나 fps를 낮춰 주세요.</span>';
+  } else if (out > 200) {
+    msg += '<br><span class="warn">프레임이 ' + out + '장이면 추출·인코딩에 시간이 걸리고 GIF 용량이 커집니다. ' +
+      'WebP나 동영상으로 저장하는 걸 권장 (추출 중 취소 가능).</span>';
+  }
   $('est').innerHTML = msg;
 }
 FIELDS.forEach(function (id) {
@@ -1545,13 +1623,12 @@ function setMode(v, silent) {
 /* ---------- 프레임 추출 ---------- */
 $('btnMake').addEventListener('click', function () { make(); });
 
-/* 인접 프레임이 완전히 같은지 (성긴 비교로 먼저 걸러낸 뒤 전체 비교) */
-function sameImg(a, b) {
-  var x = a.data, y = b.data, n = x.length, i;
-  for (i = 0; i < n; i += 97) if (x[i] !== y[i]) return false;
-  for (i = 0; i < n; i++) if (x[i] !== y[i]) return false;
-  return true;
-}
+var cancelFlag = false;
+$('btnCancel').addEventListener('click', function () {
+  cancelFlag = true;
+  $('btnCancel').disabled = true;
+  $('btnCancel').textContent = '취소 중...';
+});
 
 async function make() {
   showErr('');
@@ -1560,18 +1637,26 @@ async function make() {
      누를 수 있고, 그러면 절반만 채워진 프레임으로 인코딩된다. */
   setBusy(true);
   stopPreview();
+  clearFrameCache();
   st.cache = {};
   $('outNote').textContent = '';
   stale(false);
+  cancelFlag = false;
+  var cb = $('btnCancel');
+  cb.hidden = false; cb.disabled = false; cb.textContent = '취소';
 
   var p = plan(), c = cropPx();
   st.w = p.w; st.h = p.h; st.base = p.delay; st.dropped = 0; st.sizes = {};
+  st.truncated = false; st.stored = 0;
 
   var cv = document.createElement('canvas');
   cv.width = p.w; cv.height = p.h;
-  var ctx = cv.getContext('2d', { willReadFrequently: true });
+  var ctx = cv.getContext('2d', { alpha: false });
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = 'high';
+
+  var budget = memBudget();
+  var prevBlob = null, prevBuf = null;
 
   $('prog').hidden = false;
   st.frames = [];
@@ -1585,24 +1670,53 @@ async function make() {
     } catch (e) { /* 무시 */ }
     video.pause();
     for (var i = 0; i < p.n; i++) {
+      if (cancelFlag) break;
       var t = Math.min(st.start + i * p.span / p.n, st.dur - 0.001);
       await seekTo(video, t);
       ctx.drawImage(video, c.sx, c.sy, c.sw, c.sh, 0, 0, p.w, p.h);
-      var img = ctx.getImageData(0, 0, p.w, p.h);
-      var last = st.frames[st.frames.length - 1];
-      if (last && sameImg(last.img, img)) { last.delay += p.delay; st.dropped++; }
-      else st.frames.push({ img: img, delay: p.delay });
+      var blob = await toBlobAsync(cv);
+
+      var merged = false;
+      if (prevBlob && prevBlob.size === blob.size) {
+        if (!prevBuf) prevBuf = new Uint8Array(await prevBlob.arrayBuffer());
+        var curBuf = new Uint8Array(await blob.arrayBuffer());
+        if (sameBytes(prevBuf, curBuf)) {
+          st.frames[st.frames.length - 1].delay += p.delay;
+          st.dropped++; merged = true;
+        }
+        prevBuf = curBuf;
+      } else {
+        prevBuf = null;
+      }
+      prevBlob = blob;
+      if (!merged) {
+        st.frames.push({ blob: blob, delay: p.delay });
+        st.stored += blob.size;
+      }
+
       setProg('prog', (i + 1) / p.n, '프레임 추출 ' + (i + 1) + ' / ' + p.n +
-        (st.dropped ? '  (중복 ' + st.dropped + '장 병합)' : ''));
+        '  (' + fmtB(st.stored) + ')' +
+        (st.dropped ? '  중복 ' + st.dropped + '장 병합' : ''));
+
+      /* 압축 후 실제 누적 용량으로 판단한다. 미리 정한 장수 상한이 아니라
+         이 예산이 유일한 한계이고, 보통 수백~천 장까지 들어간다. */
+      if (st.stored > budget) { st.truncated = true; break; }
     }
   } catch (e) {
     showErr('프레임 추출 실패: ' + (e && e.message ? e.message : e));
-    setBusy(false); $('prog').hidden = true;
+    setBusy(false); $('prog').hidden = true; $('btnCancel').hidden = true;
     return;
   }
   $('prog').hidden = true;
+  $('btnCancel').hidden = true;
   setBusy(false);
   if (!st.frames.length) { showErr('프레임을 얻지 못했습니다.'); return; }
+  if (st.truncated) {
+    showErr('메모리 예산(' + fmtB(budget) + ')이 차서 ' + st.frames.length +
+      '장에서 멈췄습니다. 가로 크기나 fps를 낮추면 더 많이 담을 수 있습니다.');
+  } else if (cancelFlag) {
+    showErr('추출을 취소했습니다. 지금까지 모은 ' + st.frames.length + '장으로 만들 수 있습니다.');
+  }
   $('resultCard').hidden = false;
   startPreview();
   $('resultCard').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
@@ -1631,36 +1745,49 @@ function renderChips() {
 }
 
 /* ---------- 미리보기 ---------- */
-function stopPreview() { if (timer) { clearTimeout(timer); timer = null; } }
+var previewToken = 0;
+function stopPreview() {
+  previewToken++;
+  if (timer) { clearTimeout(timer); timer = null; }
+}
 function startPreview() {
   stopPreview();
   if (!st.frames.length) return;
+  var token = previewToken;
   var seq = seqOf(st.frames.length);
   var cv = $('preview');
   cv.width = st.w; cv.height = st.h;
   var ctx = cv.getContext('2d');
   var i = 0;
   renderChips();
-  (function step() {
+  /* 프레임이 압축 저장이라 그릴 때마다 디코딩한다. token 으로 이전 루프를
+     확실히 끊고, 다음 프레임은 미리 디코딩해 둬서 끊김을 줄인다. */
+  (async function step() {
+    if (token !== previewToken) return;
     var f = st.frames[seq[i]];
-    ctx.putImageData(f.img, 0, 0);
+    try {
+      var bmp = await frameBitmap(seq[i]);
+      if (token !== previewToken) return;
+      ctx.drawImage(bmp, 0, 0);
+    } catch (e) { /* 무시 */ }
+    if (seq.length > 1) frameBitmap(seq[(i + 1) % seq.length]).catch(function () { });
     i = (i + 1) % seq.length;
     timer = setTimeout(step, f.delay);
   })();
 }
 
 /* ---------- 팔레트 · 디더링 ---------- */
-function buildPalette(colors) {
-  var fr = st.frames, np = st.w * st.h;
-  var fStep = Math.max(1, Math.ceil(fr.length / 12));
+async function buildPalette(colors) {
+  var n = st.frames.length, np = st.w * st.h;
+  var fStep = Math.max(1, Math.ceil(n / 12));
   var picked = [];
-  for (var i = 0; i < fr.length; i += fStep) picked.push(fr[i].img);
+  for (var i = 0; i < n; i += fStep) picked.push(i);
   var pStep = Math.max(1, Math.ceil(picked.length * np / 250000));
   var cnt = 0, p;
   for (p = 0; p < np; p += pStep) cnt++;
   var buf = new Uint8Array(cnt * picked.length * 4), o = 0;
   for (i = 0; i < picked.length; i++) {
-    var d = picked[i].data;
+    var d = (await frameData(picked[i])).data;
     for (p = 0; p < np; p += pStep) {
       var s = p * 4;
       buf[o++] = d[s]; buf[o++] = d[s + 1]; buf[o++] = d[s + 2]; buf[o++] = 255;
@@ -1786,15 +1913,20 @@ function webpBitstream(buf) {
   return { chunks: out, alpha: alpha };
 }
 
-/* 두 프레임에서 달라진 픽셀의 바운딩 박스. ANMF 의 x/y 는 2픽셀 단위라 짝수로 맞춘다 */
-function dirtyRect(a, b) {
+/* 두 프레임에서 달라진 픽셀의 바운딩 박스. ANMF 의 x/y 는 2픽셀 단위라 짝수로 맞춘다.
+   프레임이 압축 저장이라 정지 영역도 ±1~2 만큼 흔들린다. tol 이하 차이는
+   같은 것으로 봐야 dirty rect 최적화가 살아남는다. */
+var DIRTY_TOL = 3;
+function dirtyRect(a, b, tol) {
+  tol = tol || 0;
   var w = st.w, h = st.h, da = a.data, db = b.data;
-  var minX = w, minY = h, maxX = -1, maxY = -1, x, y, o;
+  var minX = w, minY = h, maxX = -1, maxY = -1, x, y, o, d0, d1, d2;
   for (y = 0; y < h; y++) {
     var row = y * w * 4;
     for (x = 0; x < w; x++) {
       o = row + x * 4;
-      if (da[o] !== db[o] || da[o + 1] !== db[o + 1] || da[o + 2] !== db[o + 2]) {
+      d0 = da[o] - db[o]; d1 = da[o + 1] - db[o + 1]; d2 = da[o + 2] - db[o + 2];
+      if (d0 > tol || d0 < -tol || d1 > tol || d1 < -tol || d2 > tol || d2 < -tol) {
         if (x < minX) minX = x;
         if (x > maxX) maxX = x;
         if (y < minY) minY = y;
@@ -1834,11 +1966,16 @@ async function exportWebp() {
     var anmf = [], anyAlpha = false, saved = 0;
     for (var k = 0; k < seq.length; k++) {
       var f = st.frames[seq[k]];
-      var r = k === 0 ? { x: 0, y: 0, w: st.w, h: st.h }
-                      : dirtyRect(st.frames[seq[k - 1]].img, f.img);
+      var r;
+      if (k === 0) r = { x: 0, y: 0, w: st.w, h: st.h };
+      else {
+        var prevIm = await frameData(seq[k - 1]);
+        var curIm = await frameData(seq[k]);
+        r = dirtyRect(prevIm, curIm, DIRTY_TOL);
+      }
       saved += (st.w * st.h - r.w * r.h);
 
-      fctx.putImageData(f.img, 0, 0);
+      fctx.drawImage(await frameBitmap(seq[k]), 0, 0);
       sub.width = r.w; sub.height = r.h;
       sctx.drawImage(full, r.x, r.y, r.w, r.h, 0, 0, r.w, r.h);
 
@@ -1910,20 +2047,26 @@ async function exportGif() {
   await tick();
 
   try {
-    var pal = buildPalette(colors);
+    var pal = await buildPalette(colors);
     var seq = seqOf(st.frames.length);
     var idx = new Array(st.frames.length);
+    /* 인덱스 배열은 프레임당 w*h 바이트다. 부메랑이면 재사용되지만
+       장수가 많으면 그 캐시만 수백 MB가 되므로 그럴 땐 다시 계산한다. */
+    var keepIdx = !isCoarse() && st.frames.length * st.w * st.h < 80e6;
     var enc = gifenc.GIFEncoder();
     for (var k = 0; k < seq.length; k++) {
       var fi = seq[k], f = st.frames[fi];
-      if (!idx[fi]) {
-        if (dith === 'fs') idx[fi] = ditherFS(f.img, pal);
-        else if (dith === 'bayer') idx[fi] = gifenc.applyPalette(ditherBayer(f.img, colors), pal, 'rgb565');
-        else idx[fi] = gifenc.applyPalette(f.img.data, pal, 'rgb565');
+      var ix = idx[fi];
+      if (!ix) {
+        var im = await frameData(fi);
+        if (dith === 'fs') ix = ditherFS(im, pal);
+        else if (dith === 'bayer') ix = gifenc.applyPalette(ditherBayer(im, colors), pal, 'rgb565');
+        else ix = gifenc.applyPalette(im.data, pal, 'rgb565');
+        if (keepIdx) idx[fi] = ix;
       }
       var opts = { delay: f.delay };
       if (k === 0) { opts.palette = pal; opts.repeat = 0; }
-      enc.writeFrame(idx[fi], st.w, st.h, opts);
+      enc.writeFrame(ix, st.w, st.h, opts);
       setProg('prog2', (k + 1) / seq.length, 'GIF 인코딩 ' + (k + 1) + ' / ' + seq.length);
       if (k % 2 === 0) await tick();
     }
@@ -1966,7 +2109,7 @@ function pickMime() {
 
 $('btnVid').addEventListener('click', function () { exportVideo(); });
 
-function exportVideo() {
+async function exportVideo() {
   if (st.busy) { showErr('프레임 추출이 끝난 뒤에 저장해 주세요.'); return; }
   if (!st.frames.length) return;
   var mime = pickMime();
@@ -1981,7 +2124,7 @@ function exportVideo() {
   var cv = document.createElement('canvas');
   cv.width = st.w; cv.height = st.h;
   var ctx = cv.getContext('2d');
-  ctx.putImageData(st.frames[seq[0]].img, 0, 0);
+  ctx.drawImage(await frameBitmap(seq[0]), 0, 0);
 
   var fps = 1000 / st.base;
   var stream = cv.captureStream(Math.max(1, Math.round(fps)));
@@ -2015,13 +2158,19 @@ function exportVideo() {
 
   rec.start();
   var t0 = performance.now(), k = 0, acc = 0;
-  (function step() {
+  /* 프레임이 압축 저장이라 그릴 때마다 디코딩해야 한다. 다음 프레임을 미리
+     디코딩해 두고, 타이밍은 누적 delay 기준으로 맞춘다. */
+  (async function step() {
     if (k >= total) {
       setTimeout(function () { try { rec.stop(); } catch (e) { /* 무시 */ } }, st.base + 80);
       return;
     }
-    var f = st.frames[seq[k % seq.length]];
-    ctx.putImageData(f.img, 0, 0);
+    var fi = seq[k % seq.length];
+    var f = st.frames[fi];
+    try {
+      ctx.drawImage(await frameBitmap(fi), 0, 0);
+    } catch (e) { /* 무시 */ }
+    if (k + 1 < total) frameBitmap(seq[(k + 1) % seq.length]).catch(function () { });
     k++; acc += f.delay;
     setProg('prog2', k / total, '동영상 녹화 ' + k + ' / ' + total);
     setTimeout(step, Math.max(0, t0 + acc - performance.now()));
