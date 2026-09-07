@@ -297,6 +297,7 @@ select:focus { outline: none; border-color: #4c8dff; }
           <b style="color:#a8b0bd">GIF</b>는 호환성이 필요할 때 (카톡·구형 커뮤니티).
           움직임이 많고 긴 영상은 <b style="color:#a8b0bd">동영상</b>이 더 작을 수 있으니, 저장해 보고 위 용량을 비교하세요.
         </p>
+        <p class="note" id="supNote" style="margin-top:6px"></p>
       </div>
       <div class="prog" id="prog2" hidden>
         <div class="prog-bar"><i id="progBar2"></i></div>
@@ -2029,11 +2030,27 @@ function exportVideo() {
 
 /* ---------- 시작 ---------- */
 loadSettings();
-if (!pickMime()) $('btnVid').title = '이 브라우저는 MediaRecorder를 지원하지 않습니다';
-if (!WEBP_OK) {
-  $('btnWebp').disabled = true;
-  $('btnWebp').title = '이 브라우저는 WebP 인코딩을 지원하지 않습니다';
-}
+/* 지원 현황을 화면에 직접 띄운다. 비활성 버튼에 title 툴팁만 달면
+   폰에서는 hover 가 없어 이유를 볼 방법이 아예 없다. */
+(function showSupport() {
+  var vm = pickMime();
+  var vLabel = vm ? (vm.indexOf('mp4') >= 0 ? 'MP4' : 'WebM') : null;
+  var line = '이 브라우저 지원 — GIF ✓ · WebP ' + (WEBP_OK ? '✓' : '✗') +
+    ' · 동영상 ' + (vLabel ? '✓ ' + vLabel : '✗');
+  var extra = '';
+  if (!WEBP_OK) {
+    $('btnWebp').disabled = true;
+    $('btnWebp').title = '이 브라우저에는 WebP 인코더가 없습니다';
+    extra = '<br><span class="warn">WebP 저장을 쓸 수 없습니다 — 이 브라우저에 캔버스 WebP 인코더가 없습니다(Safari 계열).' +
+      (vLabel ? ' <b>동영상으로 저장</b>(' + vLabel + ')을 쓰시면 용량이 WebP와 비슷합니다.' : '') +
+      '</span>';
+  }
+  if (!vLabel) {
+    $('btnVid').disabled = true;
+    $('btnVid').title = '이 브라우저는 MediaRecorder를 지원하지 않습니다';
+  }
+  $('supNote').innerHTML = line + extra;
+})();
 window.addEventListener('beforeunload', function () { if (st.url) URL.revokeObjectURL(st.url); });
 
 })();
