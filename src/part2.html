@@ -1,0 +1,1236 @@
+
+/* ================= 움짤 메이커 =================
+   root 는 document 또는 shadowRoot. 갤러리 앱에 심을 때는 CSS·ID 충돌을
+   피하려고 shadow root 안에서 돌리기 때문에 DOM 조회를 root 로만 한다.
+   opts.onAttach 가 있으면 결과를 파일로 저장하는 대신 호스트에 넘긴다. */
+function gmInit(root, opts) {
+'use strict';
+opts = opts || {};
+var onAttach = typeof opts.onAttach === 'function' ? opts.onAttach : null;
+
+var $ = function (id) { return root.getElementById(id); };
+var video = $('video');
+var stage = $('stage');
+var cropBox = $('cropBox');
+var LS = 'gifmaker.settings';
+
+var st = {
+  name: '', url: null, dur: 0, vw: 0, vh: 0, size: 0,
+  start: 0, end: 0,
+  cropMode: 'off', ratio: 0, crop: { x: 0, y: 0, w: 1, h: 1 },
+  frames: [],            // { blob: 압축 스틸, delay: ms }
+  w: 0, h: 0, base: 100, dropped: 0, busy: false, sizes: {}, stored: 0, truncated: false,
+  mode: 'normal',
+  cache: {}
+};
+var timer = null;
+
+/* iOS 는 <a download> 로 파일이 저장되지 않고 새 탭에서 열린다.
+   공유 시트를 쓸 수 있으면 그쪽이 정답이라 안내를 바꿔야 한다. */
+var IOS = /iP(hone|od|ad)/.test(navigator.userAgent) ||
+  (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+/* 공유 시트가 있으면 인코딩 완료 != 저장 완료다 */
+function doneWord() { return (onAttach || SHARE_FILES) ? '만들었습니다' : '저장했습니다'; }
+function saveHint() {
+  if (!IOS || SHARE_FILES) return '';
+  return ' iOS는 파일이 새 탭에서 열릴 수 있습니다. 길게 눌러 [사진에 추가]로 저장하세요.';
+}
+
+/* ---------- 유틸 ---------- */
+function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+function fmtT(s) { return s.toFixed(2) + 's'; }
+function fmtB(b) {
+  if (b < 1024) return b + 'B';
+  if (b < 1024 * 1024) return (b / 1024).toFixed(0) + 'KB';
+  return (b / 1048576).toFixed(2) + 'MB';
+}
+function tick() { return new Promise(function (r) { setTimeout(r, 0); }); }
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"]/g, function (c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+  });
+}
+function showErr(msg) {
+  var e = $('err');
+  if (!msg) { e.hidden = true; return; }
+  e.textContent = msg; e.hidden = false;
+}
+function download(blob, filename) {
+  var a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(function () { URL.revokeObjectURL(a.href); }, 4000);
+}
+function stale(on) {
+  $('resHint').textContent = on && st.frames.length ? '— 설정이 바뀌었습니다. [움짤 만들기]를 다시 누르세요' : '';
+}
+
+/* ---------- 결과 저장 방식 선택 ----------
+   iOS 는 <a download> 로 파일이 저장되지 않고 새 탭에서 열려 버린다.
+   Web Share API 로 파일을 넘기면 네이티브 공유 시트가 떠서 [이미지 저장]
+   /[비디오 저장] 로 앨범에 바로 넣을 수 있다. 그래서 인코딩이 끝나면
+   바로 내려받지 않고 저장 방법을 고르게 한다. */
+var SHARE_FILES = (function () {
+  try {
+    if (!navigator.share || !navigator.canShare) return false;
+    var probe = new File([new Uint8Array([71, 73, 70, 56, 57, 97])], 'probe.gif', { type: 'image/gif' });
+    return navigator.canShare({ files: [probe] });
+  } catch (e) { return false; }
+})();
+var SAVE_AS = typeof window.showSaveFilePicker === 'function';
+var lastOut = null;
+
+function offerResult(blob, name) {
+  lastOut = { blob: blob, name: name };
+  $('outFile').innerHTML = '<span class="ok">✓</span> <b>' + escapeHtml(name) + '</b> · ' + fmtB(blob.size);
+  $('outActions').hidden = false;
+  var ext = name.split('.').pop().toLowerCase();
+
+  if (onAttach) {
+    /* 호스트에 넘기는 모드: 저장이 목적이 아니라 첨부가 목적이다 */
+    $('btnAttach').hidden = false;
+    $('btnShare').hidden = true;
+    $('btnSaveAs').hidden = true;
+    $('btnDl').className = 'btn ghost';
+    $('shareHint').textContent = '첨부하면 글 안에 바로 들어갑니다. 파일로도 남기고 싶으면 [파일로 저장]을 누르세요.';
+    $('outActions').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    return;
+  }
+
+  $('btnAttach').hidden = true;
+  $('btnShare').hidden = !SHARE_FILES;
+  $('btnSaveAs').hidden = !SAVE_AS;
+  $('btnDl').className = SHARE_FILES ? 'btn ghost' : 'btn';
+  $('shareHint').textContent = !SHARE_FILES ? '' :
+    (ext === 'webp'
+      ? '앨범 저장은 GIF·동영상에서 가장 확실합니다. WebP는 기기에 따라 공유 시트에 [파일에 저장]만 나올 수 있습니다.'
+      : '공유 시트에서 [이미지 저장] 또는 [비디오 저장]을 고르면 앨범에 들어갑니다.');
+  /* 공유가 안 되는 환경(대부분의 데스크톱)은 지금까지처럼 바로 내려받는다 */
+  if (!SHARE_FILES) download(blob, name);
+  $('outActions').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+$('btnDl').addEventListener('click', function () {
+  if (lastOut) download(lastOut.blob, lastOut.name);
+});
+/* share()/showSaveFilePicker() 는 사용자 제스처 안에서 곧바로 불러야 한다.
+   그래서 이 핸들러에서는 인코딩을 하지 않고 만들어 둔 blob 만 넘긴다. */
+$('btnShare').addEventListener('click', function () {
+  if (!lastOut) return;
+  var f;
+  try {
+    f = new File([lastOut.blob], lastOut.name, { type: lastOut.blob.type });
+  } catch (e) {
+    showErr('파일을 만들지 못했습니다: ' + e.message);
+    return;
+  }
+  navigator.share({ files: [f] }).catch(function (e) {
+    if (e && e.name === 'AbortError') return;          // 사용자가 취소
+    showErr('공유하지 못했습니다: ' + (e && e.message ? e.message : e));
+  });
+});
+$('btnSaveAs').addEventListener('click', function () {
+  if (!lastOut) return;
+  window.showSaveFilePicker({
+    suggestedName: lastOut.name,
+    types: [{ description: '움짤', accept: (function () {
+      var a = {}; a[lastOut.blob.type || 'application/octet-stream'] = ['.' + lastOut.name.split('.').pop()]; return a;
+    })() }]
+  }).then(function (h) {
+    return h.createWritable().then(function (w) {
+      return w.write(lastOut.blob).then(function () { return w.close(); });
+    });
+  }).catch(function (e) {
+    if (e && e.name === 'AbortError') return;
+    showErr('저장하지 못했습니다: ' + (e && e.message ? e.message : e));
+  });
+});
+function setBusy(on) {
+  st.busy = on;
+  $('btnMake').disabled = on;
+  $('btnGif').disabled = on;
+  $('btnVid').disabled = on;
+  $('btnWebp').disabled = on || !WEBP_OK;
+}
+
+/* ---------- 설정 저장/복원 ---------- */
+var FIELDS = ['selSpeed', 'selW', 'selFps', 'selColors', 'selDither', 'selWq'];
+function loadSettings() {
+  try {
+    var s = JSON.parse(localStorage.getItem(LS) || '{}');
+    FIELDS.forEach(function (id) { if (s[id] != null) $(id).value = s[id]; });
+    if (s.mode) setMode(s.mode, true);
+  } catch (e) { /* 무시 */ }
+}
+function saveSettings() {
+  var s = { mode: st.mode };
+  FIELDS.forEach(function (id) { s[id] = $(id).value; });
+  try { localStorage.setItem(LS, JSON.stringify(s)); } catch (e) { /* 무시 */ }
+}
+
+/* ---------- 파일 열기 ---------- */
+var drop = $('drop');
+drop.addEventListener('click', function () { $('file').click(); });
+drop.addEventListener('dragover', function (e) { e.preventDefault(); drop.classList.add('over'); });
+drop.addEventListener('dragleave', function () { drop.classList.remove('over'); });
+drop.addEventListener('drop', function (e) {
+  e.preventDefault(); drop.classList.remove('over');
+  if (e.dataTransfer.files && e.dataTransfer.files[0]) openFile(e.dataTransfer.files[0]);
+});
+$('file').addEventListener('change', function (e) {
+  if (e.target.files[0]) openFile(e.target.files[0]);
+});
+
+function openFile(f) {
+  if (f.type.indexOf('video') !== 0 && !/\.(mp4|webm|mov|m4v|ogv|mkv)$/i.test(f.name)) {
+    showErr('동영상 파일이 아닙니다.'); return;
+  }
+  stopPreview();
+  showErr('');
+  $('resultCard').hidden = true;
+  $('outActions').hidden = true;
+  lastOut = null;
+  clearFrameCache();
+  st.frames = []; st.cache = {};
+  if (st.url) URL.revokeObjectURL(st.url);
+  st.url = URL.createObjectURL(f);
+  st.name = f.name.replace(/\.[^.]+$/, '');
+  st.size = f.size;
+  video.src = st.url;
+  video.load();
+}
+
+video.addEventListener('loadedmetadata', function () {
+  if (!isFinite(video.duration) || video.duration <= 0) {
+    showErr('영상 길이를 읽을 수 없는 파일입니다. mp4나 webm으로 변환해 주세요.');
+    return;
+  }
+  st.dur = video.duration;
+  st.vw = video.videoWidth;
+  st.vh = video.videoHeight;
+  st.start = 0;
+  st.end = Math.min(st.dur, 4);
+  st.crop = { x: 0, y: 0, w: 1, h: 1 };
+  setCropMode('off', true);
+
+  var rs = $('rStart'), re = $('rEnd');
+  rs.min = re.min = 0;
+  rs.max = re.max = st.dur;
+  rs.step = re.step = Math.max(0.01, +(st.dur / 2000).toFixed(4));
+  rs.value = st.start; re.value = st.end;
+
+  $('editor').hidden = false;
+  renderMeta();
+  renderTrim();
+  renderCrop();
+  seek(st.start);
+});
+video.addEventListener('error', function () {
+  showErr('이 브라우저가 재생할 수 없는 코덱입니다. (mp4 H.264 / webm 권장)');
+});
+
+function renderMeta() {
+  var c = cropPx();
+  $('vmeta').innerHTML =
+    '<span>파일 <b>' + escapeHtml(st.name) + '</b></span>' +
+    '<span>원본 <b>' + st.vw + '×' + st.vh + '</b></span>' +
+    '<span>길이 <b>' + st.dur.toFixed(2) + 's</b></span>' +
+    '<span>용량 <b>' + fmtB(st.size) + '</b></span>' +
+    (st.cropMode !== 'off' ? '<span>크롭 <b>' + c.sw + '×' + c.sh + '</b></span>' : '');
+}
+
+/* ---------- 구간 슬라이더 ---------- */
+var rs = $('rStart'), re = $('rEnd');
+rs.addEventListener('input', function () {
+  st.start = clamp(+rs.value, 0, st.end - 0.1);
+  rs.value = st.start;
+  renderTrim(); seek(st.start);
+});
+re.addEventListener('input', function () {
+  st.end = clamp(+re.value, st.start + 0.1, st.dur);
+  re.value = st.end;
+  renderTrim(); seek(st.end);
+});
+
+function renderTrim() {
+  var a = st.start / st.dur * 100, b = st.end / st.dur * 100;
+  var sel = $('rsel');
+  sel.style.left = a + '%';
+  sel.style.width = (b - a) + '%';
+  $('lStart').textContent = fmtT(st.start);
+  $('lEnd').textContent = fmtT(st.end);
+  $('lDur').textContent = fmtT(st.end - st.start);
+  renderEst(); stale(true);
+}
+
+var seekBusy = false, seekWant = null;
+function seek(t) {
+  if (seekBusy) { seekWant = t; return; }
+  seekBusy = true;
+  seekTo(video, t).then(function () {
+    seekBusy = false;
+    if (seekWant != null) { var w = seekWant; seekWant = null; seek(w); }
+  });
+}
+function seekTo(v, t) {
+  return new Promise(function (res) {
+    if (Math.abs(v.currentTime - t) < 0.0008) { res(); return; }
+    var to = setTimeout(function () { done(); }, 2500);
+    function done() { clearTimeout(to); v.removeEventListener('seeked', done); res(); }
+    v.addEventListener('seeked', done);
+    v.currentTime = t;
+  });
+}
+
+/* ================= 크롭 ================= */
+function parseRatio(v) {
+  if (v === 'off' || v === 'free') return 0;
+  var p = v.split(':');
+  return +p[0] / +p[1];
+}
+/* 지정 비율(픽셀 기준 w/h)에 맞는 최대 사각형을 정규화 좌표로 */
+function ratioBox(R, cx, cy) {
+  var wN = 1, hN = st.vw / (R * st.vh);
+  if (hN > 1) { hN = 1; wN = R * st.vh / st.vw; }
+  return {
+    x: clamp(cx - wN / 2, 0, 1 - wN), y: clamp(cy - hN / 2, 0, 1 - hN),
+    w: wN, h: hN
+  };
+}
+function cropPx() {
+  var c = st.cropMode === 'off' ? { x: 0, y: 0, w: 1, h: 1 } : st.crop;
+  var sw = Math.max(2, Math.round(c.w * st.vw));
+  var sh = Math.max(2, Math.round(c.h * st.vh));
+  sw = Math.min(sw, st.vw); sh = Math.min(sh, st.vh);
+  var sx = clamp(Math.round(c.x * st.vw), 0, st.vw - sw);
+  var sy = clamp(Math.round(c.y * st.vh), 0, st.vh - sh);
+  return { sx: sx, sy: sy, sw: sw, sh: sh };
+}
+function renderCrop() {
+  cropBox.classList.toggle('off', st.cropMode === 'off');
+  if (st.cropMode === 'off') { renderMeta(); return; }
+  var c = st.crop;
+  cropBox.style.left = (c.x * 100) + '%';
+  cropBox.style.top = (c.y * 100) + '%';
+  cropBox.style.width = (c.w * 100) + '%';
+  cropBox.style.height = (c.h * 100) + '%';
+  var p = cropPx();
+  $('cropInfo').textContent = p.sw + '×' + p.sh;
+  renderMeta();
+}
+function setCropMode(v, silent) {
+  var prev = st.cropMode;
+  st.cropMode = v;
+  st.ratio = parseRatio(v);
+  Array.prototype.forEach.call($('segCrop').children, function (b) {
+    b.classList.toggle('on', b.getAttribute('data-v') === v);
+  });
+  if (v !== 'off') {
+    var cx = prev === 'off' ? 0.5 : st.crop.x + st.crop.w / 2;
+    var cy = prev === 'off' ? 0.5 : st.crop.y + st.crop.h / 2;
+    if (st.ratio) st.crop = ratioBox(st.ratio, cx, cy);
+    else if (prev === 'off') st.crop = { x: 0.1, y: 0.1, w: 0.8, h: 0.8 };
+  }
+  renderCrop();
+  if (!silent) { renderEst(); stale(true); st.cache = {}; }
+}
+$('segCrop').addEventListener('click', function (e) {
+  var b = e.target.closest ? e.target.closest('button') : null;
+  if (b) setCropMode(b.getAttribute('data-v'));
+});
+$('btnCropFull').addEventListener('click', function () {
+  if (st.cropMode === 'off') setCropMode('free');
+  st.crop = st.ratio ? ratioBox(st.ratio, 0.5, 0.5) : { x: 0, y: 0, w: 1, h: 1 };
+  renderCrop(); renderEst(); stale(true); st.cache = {};
+});
+$('btnCropCenter').addEventListener('click', function () {
+  if (st.cropMode === 'off') return;
+  st.crop.x = clamp(0.5 - st.crop.w / 2, 0, 1 - st.crop.w);
+  st.crop.y = clamp(0.5 - st.crop.h / 2, 0, 1 - st.crop.h);
+  renderCrop(); renderEst(); stale(true); st.cache = {};
+});
+
+/* 드래그 / 리사이즈 */
+var drag = null;
+cropBox.addEventListener('pointerdown', function (e) {
+  if (st.cropMode === 'off') return;
+  var h = e.target.getAttribute('data-h') || 'move';
+  var r = stage.getBoundingClientRect();
+  drag = {
+    h: h, x0: e.clientX, y0: e.clientY, rw: r.width, rh: r.height,
+    box: { x: st.crop.x, y: st.crop.y, w: st.crop.w, h: st.crop.h }
+  };
+  try { e.target.setPointerCapture(e.pointerId); } catch (err) { /* 무시 */ }
+  e.preventDefault();
+});
+window.addEventListener('pointermove', function (e) {
+  if (!drag) return;
+  var dx = (e.clientX - drag.x0) / drag.rw, dy = (e.clientY - drag.y0) / drag.rh;
+  var b0 = drag.box, R = st.ratio;
+  var minW = Math.min(0.9, 24 / st.vw), minH = Math.min(0.9, 24 / st.vh);
+  var b;
+  if (drag.h === 'move') {
+    b = { x: clamp(b0.x + dx, 0, 1 - b0.w), y: clamp(b0.y + dy, 0, 1 - b0.h), w: b0.w, h: b0.h };
+  } else {
+    var L = b0.x, T = b0.y, Rt = b0.x + b0.w, B = b0.y + b0.h;
+    if (drag.h.indexOf('w') >= 0) L = clamp(L + dx, 0, Rt - minW);
+    if (drag.h.indexOf('e') >= 0) Rt = clamp(Rt + dx, L + minW, 1);
+    if (drag.h.indexOf('n') >= 0) T = clamp(T + dy, 0, B - minH);
+    if (drag.h.indexOf('s') >= 0) B = clamp(B + dy, T + minH, 1);
+    b = { x: L, y: T, w: Rt - L, h: B - T };
+    if (R) b = lockRatio(b, drag.h, R);
+  }
+  st.crop = b;
+  renderCrop();
+});
+window.addEventListener('pointerup', function () {
+  if (!drag) return;
+  drag = null;
+  renderEst(); stale(true); st.cache = {};
+});
+
+/* 비율 고정: 드래그 방향에 따라 고정 변을 두고 나머지 한 변을 계산 */
+function lockRatio(b, h, R) {
+  var hFromW = function (w) { return w * st.vw / (R * st.vh); };
+  var wFromH = function (hh) { return hh * R * st.vh / st.vw; };
+  if (h === 'n' || h === 's') {
+    var w = Math.min(1, wFromH(b.h));
+    var cx = b.x + b.w / 2;
+    b.w = w; b.x = clamp(cx - w / 2, 0, 1 - w);
+    if (b.h > 1) b.h = 1;
+    return b;
+  }
+  var nh = hFromW(b.w);
+  if (nh > 1) { nh = 1; b.w = Math.min(1, wFromH(1)); }
+  if (h === 'w' || h === 'e') {
+    var cy = b.y + b.h / 2;
+    b.h = nh; b.y = clamp(cy - nh / 2, 0, 1 - nh);
+  } else if (h.indexOf('n') >= 0) {
+    var bottom = b.y + b.h;
+    b.h = nh; b.y = clamp(bottom - nh, 0, 1 - nh);
+  } else {
+    b.h = nh;
+    if (b.y + b.h > 1) { b.h = 1 - b.y; b.w = Math.min(1, wFromH(b.h)); }
+  }
+  b.x = clamp(b.x, 0, 1 - b.w);
+  b.y = clamp(b.y, 0, 1 - b.h);
+  return b;
+}
+
+/* ---------- 출력 규격 ---------- */
+function baseDelay(fps) { return Math.max(20, Math.round(1000 / fps / 10) * 10); }
+function outSize() {
+  var c = cropPx();
+  var want = +$('selW').value || c.sw;
+  var w = Math.min(want, c.sw);
+  var h = Math.round(w * c.sh / c.sw);
+  w -= w % 2; h -= h % 2;
+  return { w: Math.max(2, w), h: Math.max(2, h) };
+}
+/* ================= 프레임 저장소 =================
+   프레임을 raw RGBA 로 들고 있으면 480x854 기준 1.6MB/장이라 메모리가 금방
+   차고 장수 상한이 생긴다(모바일에서 42장). 그래서 추출하는 즉시 압축 스틸
+   (WebP, 없으면 JPEG)로 바꿔 두고 픽셀이 필요한 순간에만 디코딩한다.
+   같은 크기에서 15~25배 적게 써서 장수 제한이 실질적으로 사라진다. */
+function isCoarse() {
+  return typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches;
+}
+function memBudget() { return isCoarse() ? 120e6 : 320e6; }
+var HARD_MAX = 2000;            // 추출 시간·출력 용량 때문에 두는 절대 상한
+var STORE_Q = 0.94;
+function storeMime() { return WEBP_NATIVE ? 'image/webp' : 'image/jpeg'; }
+
+function plan() {
+  var fps = +$('selFps').value, speed = +$('selSpeed').value;
+  var s = outSize();
+  var span = st.end - st.start;
+  var want = Math.max(2, Math.round(span / speed * fps));
+  return {
+    w: s.w, h: s.h, fps: fps, speed: speed, span: span,
+    n: Math.min(want, HARD_MAX), want: want, delay: baseDelay(fps)
+  };
+}
+
+function toBlobAsync(canvas) {
+  return new Promise(function (res, rej) {
+    canvas.toBlob(function (b) {
+      b ? res(b) : rej(new Error('프레임을 이미지로 저장하지 못했습니다'));
+    }, storeMime(), STORE_Q);
+  });
+}
+/* 인접 프레임 중복 판정. 픽셀이 같으면 인코더 출력도 바이트까지 같으므로
+   raw 픽셀을 다시 읽지 않고 인코딩된 바이트를 비교한다. */
+function sameBytes(a, b) {
+  if (a.length !== b.length) return false;
+  var i;
+  for (i = 0; i < a.length; i += 97) if (a[i] !== b[i]) return false;
+  for (i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+var bmpCache = new Map();       // 프레임 인덱스 -> 디코딩된 비트맵 (LRU)
+var BMP_MAX = 12;
+var work = null, wctx = null;
+
+async function decodeBlob(blob) {
+  if (typeof createImageBitmap === 'function') {
+    return { img: await createImageBitmap(blob), url: null };
+  }
+  var url = URL.createObjectURL(blob);        // createImageBitmap 없는 구형 사파리
+  var im = new Image();
+  im.src = url;
+  if (im.decode) await im.decode();
+  else await new Promise(function (r, j) { im.onload = r; im.onerror = j; });
+  return { img: im, url: url };
+}
+function releaseEntry(e) {
+  if (e.img && e.img.close) e.img.close();
+  if (e.url) URL.revokeObjectURL(e.url);
+}
+function clearFrameCache() {
+  bmpCache.forEach(releaseEntry);
+  bmpCache.clear();
+}
+async function frameBitmap(i) {
+  var hit = bmpCache.get(i);
+  if (hit) { bmpCache.delete(i); bmpCache.set(i, hit); return hit.img; }
+  var e = await decodeBlob(st.frames[i].blob);
+  bmpCache.set(i, e);
+  while (bmpCache.size > BMP_MAX) {
+    var k = bmpCache.keys().next().value;
+    var old = bmpCache.get(k);
+    bmpCache.delete(k);
+    releaseEntry(old);
+  }
+  return e.img;
+}
+/* 인코딩용 RGBA. 작업 캔버스 하나를 재사용한다 */
+async function frameData(i) {
+  if (!work) {
+    work = document.createElement('canvas');
+    wctx = work.getContext('2d', { alpha: false, willReadFrequently: true });
+  }
+  if (work.width !== st.w || work.height !== st.h) { work.width = st.w; work.height = st.h; }
+  wctx.drawImage(await frameBitmap(i), 0, 0);
+  return wctx.getImageData(0, 0, st.w, st.h);
+}
+function seqOf(n) {
+  var a = [], i;
+  for (i = 0; i < n; i++) a.push(i);
+  if (st.mode === 'boomerang' && n >= 3) for (i = n - 2; i >= 1; i--) a.push(i);
+  return a;
+}
+function totalMs(seq) {
+  var t = 0;
+  for (var i = 0; i < seq.length; i++) t += st.frames[seq[i]].delay;
+  return t;
+}
+
+function renderEst() {
+  if (!st.dur) return;
+  var p = plan();
+  var out = st.mode === 'boomerang' && p.n >= 3 ? p.n * 2 - 2 : p.n;
+  var msg = '추출 <b>' + p.n + '장</b>' +
+    (st.mode === 'boomerang' ? ' &rarr; 부메랑 <b>' + out + '장</b>' : '') +
+    ' &nbsp;·&nbsp; 출력 <b>' + p.w + '×' + p.h + '</b>' +
+    ' &nbsp;·&nbsp; 재생 <b>' + (out * p.delay / 1000).toFixed(2) + 's</b>' +
+    ' &nbsp;·&nbsp; 실제 <b>' + (1000 / p.delay).toFixed(1) + ' fps</b>';
+  if (p.speed < 1) msg += '<br>느린 배속은 같은 프레임이 반복될 수 있어, 중복 프레임은 자동으로 하나로 합쳐 표시 시간을 늘립니다.';
+  if (p.want > HARD_MAX) {
+    msg += '<br><span class="warn">한 번에 ' + HARD_MAX + '장까지만 추출합니다 (요청 ' + p.want +
+      '장). 구간을 줄이거나 fps를 낮춰 주세요.</span>';
+  } else if (out > 200) {
+    msg += '<br><span class="warn">프레임이 ' + out + '장이면 추출·인코딩에 시간이 걸리고 GIF 용량이 커집니다. ' +
+      'WebP나 동영상으로 저장하는 걸 권장 (추출 중 취소 가능).</span>';
+  }
+  $('est').innerHTML = msg;
+}
+FIELDS.forEach(function (id) {
+  $(id).addEventListener('change', function () {
+    renderEst(); saveSettings(); st.cache = {}; stale(true);
+  });
+});
+
+/* ---------- 모드 ---------- */
+function setMode(v, silent) {
+  st.mode = v;
+  ['segMode', 'segMode2'].forEach(function (id) {
+    var seg = $(id);
+    if (!seg) return;
+    Array.prototype.forEach.call(seg.children, function (b) {
+      b.classList.toggle('on', b.getAttribute('data-v') === v);
+    });
+  });
+  renderEst();
+  if (!silent) { saveSettings(); st.cache = {}; if (st.frames.length) startPreview(); }
+}
+['segMode', 'segMode2'].forEach(function (id) {
+  $(id).addEventListener('click', function (e) {
+    var b = e.target.closest ? e.target.closest('button') : null;
+    if (b) setMode(b.getAttribute('data-v'));
+  });
+});
+
+/* ---------- 프레임 추출 ---------- */
+$('btnMake').addEventListener('click', function () { make(); });
+
+var cancelFlag = false;
+$('btnCancel').addEventListener('click', function () {
+  cancelFlag = true;
+  $('btnCancel').disabled = true;
+  $('btnCancel').textContent = '취소 중...';
+});
+
+async function make() {
+  showErr('');
+  var btn = $('btnMake');
+  /* 추출 중에는 저장을 막는다. 이전 결과가 화면에 남아 있으면 저장 버튼을
+     누를 수 있고, 그러면 절반만 채워진 프레임으로 인코딩된다. */
+  setBusy(true);
+  stopPreview();
+  clearFrameCache();
+  st.cache = {};
+  $('outNote').textContent = '';
+  $('outActions').hidden = true;
+  lastOut = null;
+  stale(false);
+  cancelFlag = false;
+  var cb = $('btnCancel');
+  cb.hidden = false; cb.disabled = false; cb.textContent = '취소';
+
+  var p = plan(), c = cropPx();
+  st.w = p.w; st.h = p.h; st.base = p.delay; st.dropped = 0; st.sizes = {};
+  st.truncated = false; st.stored = 0;
+
+  var cv = document.createElement('canvas');
+  cv.width = p.w; cv.height = p.h;
+  var ctx = cv.getContext('2d', { alpha: false });
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+
+  var budget = memBudget();
+  var prevBlob = null, prevBuf = null;
+
+  $('prog').hidden = false;
+  st.frames = [];
+  try {
+    /* iOS Safari 는 한 번 재생을 거쳐야 seek 한 프레임을 캔버스에 그릴 수 있다.
+       이 함수는 버튼 클릭(사용자 제스처) 안에서 실행되므로 play() 가 허용된다. */
+    video.muted = true;
+    try {
+      var pp = video.play();
+      if (pp && pp.then) await pp.catch(function () { });
+    } catch (e) { /* 무시 */ }
+    video.pause();
+    for (var i = 0; i < p.n; i++) {
+      if (cancelFlag) break;
+      var t = Math.min(st.start + i * p.span / p.n, st.dur - 0.001);
+      await seekTo(video, t);
+      ctx.drawImage(video, c.sx, c.sy, c.sw, c.sh, 0, 0, p.w, p.h);
+      var blob = await toBlobAsync(cv);
+
+      var merged = false;
+      if (prevBlob && prevBlob.size === blob.size) {
+        if (!prevBuf) prevBuf = new Uint8Array(await prevBlob.arrayBuffer());
+        var curBuf = new Uint8Array(await blob.arrayBuffer());
+        if (sameBytes(prevBuf, curBuf)) {
+          st.frames[st.frames.length - 1].delay += p.delay;
+          st.dropped++; merged = true;
+        }
+        prevBuf = curBuf;
+      } else {
+        prevBuf = null;
+      }
+      prevBlob = blob;
+      if (!merged) {
+        st.frames.push({ blob: blob, delay: p.delay });
+        st.stored += blob.size;
+      }
+
+      setProg('prog', (i + 1) / p.n, '프레임 추출 ' + (i + 1) + ' / ' + p.n +
+        '  (' + fmtB(st.stored) + ')' +
+        (st.dropped ? '  중복 ' + st.dropped + '장 병합' : ''));
+
+      /* 압축 후 실제 누적 용량으로 판단한다. 미리 정한 장수 상한이 아니라
+         이 예산이 유일한 한계이고, 보통 수백~천 장까지 들어간다. */
+      if (st.stored > budget) { st.truncated = true; break; }
+    }
+  } catch (e) {
+    showErr('프레임 추출 실패: ' + (e && e.message ? e.message : e));
+    setBusy(false); $('prog').hidden = true; $('btnCancel').hidden = true;
+    return;
+  }
+  $('prog').hidden = true;
+  $('btnCancel').hidden = true;
+  setBusy(false);
+  if (!st.frames.length) { showErr('프레임을 얻지 못했습니다.'); return; }
+  if (st.truncated) {
+    showErr('메모리 예산(' + fmtB(budget) + ')이 차서 ' + st.frames.length +
+      '장에서 멈췄습니다. 가로 크기나 fps를 낮추면 더 많이 담을 수 있습니다.');
+  } else if (cancelFlag) {
+    showErr('추출을 취소했습니다. 지금까지 모은 ' + st.frames.length + '장으로 만들 수 있습니다.');
+  }
+  $('resultCard').hidden = false;
+  startPreview();
+  $('resultCard').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function setProg(id, ratio, txt) {
+  $(id === 'prog' ? 'progBar' : 'progBar2').style.width = (ratio * 100).toFixed(1) + '%';
+  $(id === 'prog' ? 'progTxt' : 'progTxt2').textContent = txt;
+}
+
+/* 저장한 포맷들의 용량을 나란히 보여준다 (포맷 비교가 이 앱의 핵심 판단 재료) */
+function renderChips() {
+  var seq = seqOf(st.frames.length);
+  var ms = totalMs(seq);
+  var html =
+    '<span class="chip">프레임 <b>' + st.frames.length + '</b></span>' +
+    '<span class="chip">재생 프레임 <b>' + seq.length + '</b></span>' +
+    '<span class="chip">크기 <b>' + st.w + '×' + st.h + '</b></span>' +
+    '<span class="chip">재생 <b>' + (ms / 1000).toFixed(2) + 's</b></span>' +
+    '<span class="chip">배속 <b>' + $('selSpeed').value + 'x</b></span>' +
+    (st.dropped ? '<span class="chip">중복 병합 <b>' + st.dropped + '</b></span>' : '');
+  ['WEBP', 'GIF', 'MP4', 'WEBM'].forEach(function (k) {
+    if (st.sizes[k]) html += '<span class="chip">' + k + ' <b>' + fmtB(st.sizes[k]) + '</b></span>';
+  });
+  $('chips').innerHTML = html;
+}
+
+/* ---------- 미리보기 ---------- */
+var previewToken = 0;
+function stopPreview() {
+  previewToken++;
+  if (timer) { clearTimeout(timer); timer = null; }
+}
+function startPreview() {
+  stopPreview();
+  if (!st.frames.length) return;
+  var token = previewToken;
+  var seq = seqOf(st.frames.length);
+  var cv = $('preview');
+  cv.width = st.w; cv.height = st.h;
+  var ctx = cv.getContext('2d');
+  var i = 0;
+  renderChips();
+  /* 프레임이 압축 저장이라 그릴 때마다 디코딩한다. token 으로 이전 루프를
+     확실히 끊고, 다음 프레임은 미리 디코딩해 둬서 끊김을 줄인다. */
+  (async function step() {
+    if (token !== previewToken) return;
+    var f = st.frames[seq[i]];
+    try {
+      var bmp = await frameBitmap(seq[i]);
+      if (token !== previewToken) return;
+      ctx.drawImage(bmp, 0, 0);
+    } catch (e) { /* 무시 */ }
+    if (seq.length > 1) frameBitmap(seq[(i + 1) % seq.length]).catch(function () { });
+    i = (i + 1) % seq.length;
+    timer = setTimeout(step, f.delay);
+  })();
+}
+
+/* ---------- 팔레트 · 디더링 ---------- */
+async function buildPalette(colors) {
+  var n = st.frames.length, np = st.w * st.h;
+  var fStep = Math.max(1, Math.ceil(n / 12));
+  var picked = [];
+  for (var i = 0; i < n; i += fStep) picked.push(i);
+  var pStep = Math.max(1, Math.ceil(picked.length * np / 250000));
+  var cnt = 0, p;
+  for (p = 0; p < np; p += pStep) cnt++;
+  var buf = new Uint8Array(cnt * picked.length * 4), o = 0;
+  for (i = 0; i < picked.length; i++) {
+    var d = (await frameData(picked[i])).data;
+    for (p = 0; p < np; p += pStep) {
+      var s = p * 4;
+      buf[o++] = d[s]; buf[o++] = d[s + 1]; buf[o++] = d[s + 2]; buf[o++] = 255;
+    }
+  }
+  return gifenc.quantize(buf, colors, { format: 'rgb565', clearAlpha: false });
+}
+
+var BAYER = [
+  [0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]
+];
+function ditherBayer(img, colors) {
+  var w = st.w, h = st.h, d = img.data;
+  var out = new Uint8ClampedArray(d.length);
+  var amp = colors >= 256 ? 14 : (colors >= 128 ? 20 : 30);
+  for (var y = 0; y < h; y++) {
+    for (var x = 0; x < w; x++) {
+      var o = (y * w + x) * 4;
+      var k = (BAYER[y & 3][x & 3] / 16 - 0.46875) * amp;
+      out[o] = d[o] + k; out[o + 1] = d[o + 1] + k; out[o + 2] = d[o + 2] + k; out[o + 3] = 255;
+    }
+  }
+  return new Uint8Array(out.buffer);
+}
+
+/* Floyd-Steinberg: rgb565 캐시로 최근접 색 탐색 비용을 줄인다 */
+function ditherFS(img, pal) {
+  var w = st.w, h = st.h, d = img.data, n = w * h;
+  var buf = new Float32Array(n * 3);
+  for (var i = 0, o = 0, s = 0; i < n; i++, s += 4) {
+    buf[o++] = d[s]; buf[o++] = d[s + 1]; buf[o++] = d[s + 2];
+  }
+  var index = new Uint8Array(n);
+  var cache = new Int16Array(65536);
+  cache.fill(-1);
+  var px = [0, 0, 0];
+  for (var y = 0; y < h; y++) {
+    for (var x = 0; x < w; x++) {
+      var p = (y * w + x) * 3;
+      var r = buf[p], g = buf[p + 1], b = buf[p + 2];
+      r = r < 0 ? 0 : (r > 255 ? 255 : r | 0);
+      g = g < 0 ? 0 : (g > 255 ? 255 : g | 0);
+      b = b < 0 ? 0 : (b > 255 ? 255 : b | 0);
+      var key = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+      var ci = cache[key];
+      if (ci < 0) {
+        px[0] = r; px[1] = g; px[2] = b;
+        ci = gifenc.nearestColorIndex(pal, px);
+        cache[key] = ci;
+      }
+      index[y * w + x] = ci;
+      var c = pal[ci];
+      var er = r - c[0], eg = g - c[1], eb = b - c[2];
+      if (x + 1 < w) {
+        buf[p + 3] += er * 0.4375; buf[p + 4] += eg * 0.4375; buf[p + 5] += eb * 0.4375;
+      }
+      if (y + 1 < h) {
+        var q = ((y + 1) * w + x) * 3;
+        if (x > 0) { buf[q - 3] += er * 0.1875; buf[q - 2] += eg * 0.1875; buf[q - 1] += eb * 0.1875; }
+        buf[q] += er * 0.3125; buf[q + 1] += eg * 0.3125; buf[q + 2] += eb * 0.3125;
+        if (x + 1 < w) { buf[q + 3] += er * 0.0625; buf[q + 4] += eg * 0.0625; buf[q + 5] += eb * 0.0625; }
+      }
+    }
+  }
+  return index;
+}
+
+/* ================= 애니메이션 WebP =================
+   브라우저에는 애니메이션 WebP 인코더가 없다. 대신 프레임마다
+   canvas.toBlob('image/webp') 로 정지 WebP 를 만들고, 그 안의 VP8
+   비트스트림 청크를 꺼내 RIFF/ANMF 컨테이너로 직접 이어 붙인다.
+   프레임마다 바뀐 영역(dirty rect)만 인코딩해 용량을 더 줄인다. */
+
+/* 캔버스가 WebP 를 직접 인코딩할 수 있는가 (사파리는 못 한다) */
+var WEBP_NATIVE = (function () {
+  try {
+    var c = document.createElement('canvas');
+    c.width = c.height = 2;
+    return c.toDataURL('image/webp').indexOf('data:image/webp') === 0;
+  } catch (e) { return false; }
+})();
+/* 못 하면 내장 libwebp(wasm) 로 돌린다 */
+var WEBP_WASM = typeof __webpEncFactory === 'function' && typeof __webpWasmB64 === 'string';
+var WEBP_OK = WEBP_NATIVE || WEBP_WASM;
+
+var wasmEnc = null, wasmEncPromise = null;
+function b64ToBytes(b64) {
+  var bin = atob(b64), out = new Uint8Array(bin.length);
+  for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+function initWasmWebp() {
+  if (wasmEnc) return Promise.resolve(wasmEnc);
+  if (!wasmEncPromise) {
+    wasmEncPromise = __webpEncFactory({ wasmBinary: b64ToBytes(__webpWasmB64) })
+      .then(function (m) { wasmEnc = m; return m; });
+  }
+  return wasmEncPromise;
+}
+/* libwebp 기본값. thread_level 0 은 필수(이 빌드는 pthread 없음),
+   method 는 압축률/속도 트레이드오프. 480x854 실측으로 2 를 골랐다:
+   m0 18ms/37KB, m1 18ms/34KB, m2 21ms/26KB, m3 63ms/24KB, m4 56ms/25KB.
+   m3 는 3배 느린데 용량은 8%만 줄어 프레임이 많은 이 용도엔 안 맞는다. */
+function wasmOpts(q100) {
+  return {
+    quality: q100, target_size: 0, target_PSNR: 0, method: 2,
+    sns_strength: 50, filter_strength: 60, filter_sharpness: 0, filter_type: 1,
+    partitions: 0, segments: 4, pass: 1, show_compressed: 0, preprocessing: 0,
+    autofilter: 0, partition_limit: 0, alpha_compression: 1, alpha_filtering: 1,
+    alpha_quality: 100, lossless: 0, exact: 0, image_hint: 0,
+    emulate_jpeg_size: 0, thread_level: 0, low_memory: 0, near_lossless: 100,
+    use_delta_palette: 0, use_sharp_yuv: 0
+  };
+}
+/* RGBA -> 완성된 정지 .webp 바이트 */
+async function wasmEncodeWebp(rgba, w, h, q100) {
+  var m = await initWasmWebp();
+  var out = m.encode(rgba, w, h, wasmOpts(q100));
+  if (!out || !out.length) throw new Error('libwebp 인코딩이 빈 결과를 돌려줬습니다');
+  return new Uint8Array(out);          // 모듈 힙 뷰일 수 있어 복사해 둔다
+}
+
+function u16(v) { return [v & 255, (v >> 8) & 255]; }
+function u24(v) { return [v & 255, (v >> 8) & 255, (v >> 16) & 255]; }
+function u32(v) { return [v & 255, (v >>> 8) & 255, (v >>> 16) & 255, (v >>> 24) & 255]; }
+function fourcc(s) { return [s.charCodeAt(0), s.charCodeAt(1), s.charCodeAt(2), s.charCodeAt(3)]; }
+
+/* RIFF 청크 하나 만들기 (홀수 크기는 1바이트 패딩) */
+function riffChunk(tag, payload) {
+  var pad = payload.length & 1;
+  var out = new Uint8Array(8 + payload.length + pad);
+  out.set(fourcc(tag), 0);
+  out.set(u32(payload.length), 4);
+  out.set(payload, 8);
+  return out;
+}
+function concatBytes(list) {
+  var n = 0, i;
+  for (i = 0; i < list.length; i++) n += list[i].length;
+  var out = new Uint8Array(n), o = 0;
+  for (i = 0; i < list.length; i++) { out.set(list[i], o); o += list[i].length; }
+  return out;
+}
+
+/* 정지 WebP 에서 ALPH / VP8 / VP8L 청크만(헤더 포함) 뽑아낸다 */
+function webpBitstream(buf) {
+  if (String.fromCharCode(buf[0], buf[1], buf[2], buf[3]) !== 'RIFF' ||
+      String.fromCharCode(buf[8], buf[9], buf[10], buf[11]) !== 'WEBP') {
+    throw new Error('정지 WebP 형식이 아닙니다');
+  }
+  var dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  var out = [], alpha = false, pos = 12;
+  while (pos + 8 <= buf.length) {
+    var tag = String.fromCharCode(buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]);
+    var size = dv.getUint32(pos + 4, true);
+    var whole = 8 + size + (size & 1);
+    if (tag === 'ALPH' || tag === 'VP8 ' || tag === 'VP8L') {
+      out.push(buf.subarray(pos, pos + whole));
+      if (tag === 'ALPH') alpha = true;
+    }
+    pos += whole;
+  }
+  if (!out.length) throw new Error('VP8 비트스트림을 찾지 못했습니다');
+  return { chunks: out, alpha: alpha };
+}
+
+/* 두 프레임에서 달라진 픽셀의 바운딩 박스. ANMF 의 x/y 는 2픽셀 단위라 짝수로 맞춘다.
+   프레임이 압축 저장이라 정지 영역도 ±1~2 만큼 흔들린다. tol 이하 차이는
+   같은 것으로 봐야 dirty rect 최적화가 살아남는다. */
+var DIRTY_TOL = 3;
+function dirtyRect(a, b, tol) {
+  tol = tol || 0;
+  var w = st.w, h = st.h, da = a.data, db = b.data;
+  var minX = w, minY = h, maxX = -1, maxY = -1, x, y, o, d0, d1, d2;
+  for (y = 0; y < h; y++) {
+    var row = y * w * 4;
+    for (x = 0; x < w; x++) {
+      o = row + x * 4;
+      d0 = da[o] - db[o]; d1 = da[o + 1] - db[o + 1]; d2 = da[o + 2] - db[o + 2];
+      if (d0 > tol || d0 < -tol || d1 > tol || d1 < -tol || d2 > tol || d2 < -tol) {
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+  if (maxX < 0) return { x: 0, y: 0, w: 2, h: 2 };   // 완전히 동일한 경우
+  minX &= ~1; minY &= ~1;
+  return { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 };
+}
+
+$('btnWebp').addEventListener('click', function () { exportWebp(); });
+
+async function exportWebp() {
+  if (st.busy) { showErr('프레임 추출이 끝난 뒤에 저장해 주세요.'); return; }
+  if (!st.frames.length) return;
+  if (!WEBP_OK) { showErr('이 브라우저는 WebP 인코딩을 지원하지 않습니다.'); return; }
+  var q = +$('selWq').value;
+  var key = 'webp|' + st.mode + '|' + q;
+  if (st.cache[key]) { offerResult(st.cache[key], outName('webp')); return; }
+
+  var bs = [$('btnWebp'), $('btnGif'), $('btnVid')];
+  bs.forEach(function (b) { b.disabled = true; });
+  $('prog2').hidden = false;
+  setProg('prog2', 0.02, WEBP_NATIVE ? 'WebP 인코딩 준비...' : 'WebP 인코더(libwebp) 준비 중...');
+  await tick();
+
+  try {
+    var seq = seqOf(st.frames.length);
+    var full = document.createElement('canvas');
+    full.width = st.w; full.height = st.h;
+    var fctx = full.getContext('2d', { alpha: false });
+    var sub = document.createElement('canvas');
+    var sctx = sub.getContext('2d', { alpha: false, willReadFrequently: !WEBP_NATIVE });
+
+    var anmf = [], anyAlpha = false, saved = 0;
+    for (var k = 0; k < seq.length; k++) {
+      var f = st.frames[seq[k]];
+      var r;
+      if (k === 0) r = { x: 0, y: 0, w: st.w, h: st.h };
+      else {
+        var prevIm = await frameData(seq[k - 1]);
+        var curIm = await frameData(seq[k]);
+        r = dirtyRect(prevIm, curIm, DIRTY_TOL);
+      }
+      saved += (st.w * st.h - r.w * r.h);
+
+      fctx.drawImage(await frameBitmap(seq[k]), 0, 0);
+      sub.width = r.w; sub.height = r.h;
+      sctx.drawImage(full, r.x, r.y, r.w, r.h, 0, 0, r.w, r.h);
+
+      var bytes;
+      if (WEBP_NATIVE) {
+        var blob = await new Promise(function (res) { sub.toBlob(res, 'image/webp', q); });
+        if (!blob) throw new Error('WebP 프레임 인코딩에 실패했습니다');
+        bytes = new Uint8Array(await blob.arrayBuffer());
+      } else {
+        var sd = sctx.getImageData(0, 0, r.w, r.h);
+        bytes = await wasmEncodeWebp(sd.data, r.w, r.h, Math.round(q * 100));
+      }
+      var got = webpBitstream(bytes);
+      if (got.alpha) anyAlpha = true;
+
+      var head = new Uint8Array(16);
+      head.set(u24(r.x >> 1), 0);
+      head.set(u24(r.y >> 1), 3);
+      head.set(u24(r.w - 1), 6);
+      head.set(u24(r.h - 1), 9);
+      head.set(u24(f.delay), 12);
+      head[15] = 0x02;                       // B=1 블렌딩 안 함, D=0 폐기 안 함
+      anmf.push(riffChunk('ANMF', concatBytes([head].concat(got.chunks))));
+
+      setProg('prog2', (k + 1) / seq.length, 'WebP 인코딩 ' + (k + 1) + ' / ' + seq.length);
+      if (k % 2 === 0) await tick();
+    }
+
+    var vp8x = new Uint8Array(10);
+    vp8x[0] = 0x02 | (anyAlpha ? 0x10 : 0);  // Animation (+ Alpha)
+    vp8x.set(u24(st.w - 1), 4);
+    vp8x.set(u24(st.h - 1), 7);
+    var anim = new Uint8Array(6);            // 배경 투명 + 무한 반복
+    anim.set(u16(0), 4);
+
+    var body = concatBytes([riffChunk('VP8X', vp8x), riffChunk('ANIM', anim)].concat(anmf));
+    var out = new Uint8Array(12 + body.length);
+    out.set(fourcc('RIFF'), 0);
+    out.set(u32(4 + body.length), 4);
+    out.set(fourcc('WEBP'), 8);
+    out.set(body, 12);
+
+    var wblob = new Blob([out], { type: 'image/webp' });
+    st.cache[key] = wblob;
+    st.sizes.WEBP = wblob.size;
+    $('prog2').hidden = true;
+    renderChips();
+    var pct = Math.round(saved / (st.w * st.h * seq.length) * 100);
+    $('outNote').textContent = 'WebP ' + fmtB(wblob.size) + ' ' + doneWord() + '.' +
+      (pct > 0 ? ' 바뀐 영역만 인코딩해 픽셀 ' + pct + '%를 덜 담았습니다.' : '') +
+      (st.sizes.GIF ? ' 같은 움짤 GIF는 ' + fmtB(st.sizes.GIF) + '였습니다.' : '') +
+      saveHint();
+    offerResult(wblob, outName('webp'));
+  } catch (e) {
+    $('prog2').hidden = true;
+    showErr('WebP 인코딩 실패: ' + (e && e.message ? e.message : e));
+  }
+  bs.forEach(function (b) { b.disabled = false; });
+  $('btnWebp').disabled = !WEBP_OK;
+}
+
+/* ---------- GIF 저장 ---------- */
+$('btnGif').addEventListener('click', function () { exportGif(); });
+
+async function exportGif() {
+  if (st.busy) { showErr('프레임 추출이 끝난 뒤에 저장해 주세요.'); return; }
+  if (!st.frames.length) return;
+  var colors = +$('selColors').value, dith = $('selDither').value;
+  var key = 'gif|' + st.mode + '|' + colors + '|' + dith;
+  if (st.cache[key]) { offerResult(st.cache[key], outName('gif')); return; }
+
+  var b1 = $('btnGif'), b2 = $('btnVid');
+  b1.disabled = b2.disabled = true;
+  $('prog2').hidden = false;
+  setProg('prog2', 0.02, '팔레트 계산 중...');
+  await tick();
+
+  try {
+    var pal = await buildPalette(colors);
+    var seq = seqOf(st.frames.length);
+    var idx = new Array(st.frames.length);
+    /* 인덱스 배열은 프레임당 w*h 바이트다. 부메랑이면 재사용되지만
+       장수가 많으면 그 캐시만 수백 MB가 되므로 그럴 땐 다시 계산한다. */
+    var keepIdx = !isCoarse() && st.frames.length * st.w * st.h < 80e6;
+    var enc = gifenc.GIFEncoder();
+    for (var k = 0; k < seq.length; k++) {
+      var fi = seq[k], f = st.frames[fi];
+      var ix = idx[fi];
+      if (!ix) {
+        var im = await frameData(fi);
+        if (dith === 'fs') ix = ditherFS(im, pal);
+        else if (dith === 'bayer') ix = gifenc.applyPalette(ditherBayer(im, colors), pal, 'rgb565');
+        else ix = gifenc.applyPalette(im.data, pal, 'rgb565');
+        if (keepIdx) idx[fi] = ix;
+      }
+      var opts = { delay: f.delay };
+      if (k === 0) { opts.palette = pal; opts.repeat = 0; }
+      enc.writeFrame(ix, st.w, st.h, opts);
+      setProg('prog2', (k + 1) / seq.length, 'GIF 인코딩 ' + (k + 1) + ' / ' + seq.length);
+      if (k % 2 === 0) await tick();
+    }
+    enc.finish();
+    var bytes = enc.bytesView ? enc.bytesView() : enc.bytes();
+    var blob = new Blob([bytes], { type: 'image/gif' });
+    st.cache[key] = blob;
+    $('prog2').hidden = true;
+    st.sizes.GIF = blob.size; renderChips();
+    $('outNote').textContent = 'GIF ' + fmtB(blob.size) +
+      ' ' + doneWord() + '. 용량이 크면 가로 크기 · fps · 색상 수를 낮춰 보세요.' + saveHint();
+    offerResult(blob, outName('gif'));
+  } catch (e) {
+    $('prog2').hidden = true;
+    showErr('GIF 인코딩 실패: ' + (e && e.message ? e.message : e));
+  }
+  b1.disabled = b2.disabled = false;
+}
+function outName(ext) {
+  var sp = $('selSpeed').value;
+  return st.name +
+    (st.cropMode !== 'off' ? '_crop' : '') +
+    (sp !== '1' ? '_' + sp + 'x' : '') +
+    (st.mode === 'boomerang' ? '_boomerang' : '') + '.' + ext;
+}
+
+/* ---------- 동영상 저장 (MediaRecorder) ---------- */
+var MIMES = [
+  'video/mp4;codecs=avc1.42E01E',
+  'video/mp4',
+  'video/webm;codecs=vp9',
+  'video/webm;codecs=vp8',
+  'video/webm'
+];
+function pickMime() {
+  if (typeof MediaRecorder === 'undefined' || !MediaRecorder.isTypeSupported) return null;
+  for (var i = 0; i < MIMES.length; i++) if (MediaRecorder.isTypeSupported(MIMES[i])) return MIMES[i];
+  return null;
+}
+
+$('btnVid').addEventListener('click', function () { exportVideo(); });
+
+async function exportVideo() {
+  if (st.busy) { showErr('프레임 추출이 끝난 뒤에 저장해 주세요.'); return; }
+  if (!st.frames.length) return;
+  var mime = pickMime();
+  if (!mime) { showErr('이 브라우저는 동영상 녹화(MediaRecorder)를 지원하지 않습니다. GIF로 저장해 주세요.'); return; }
+  showErr('');
+  var b1 = $('btnGif'), b2 = $('btnVid');
+  b1.disabled = b2.disabled = true;
+  $('prog2').hidden = false;
+
+  var seq = seqOf(st.frames.length);
+  var loops = 2, total = seq.length * loops;
+  var cv = document.createElement('canvas');
+  cv.width = st.w; cv.height = st.h;
+  var ctx = cv.getContext('2d');
+  ctx.drawImage(await frameBitmap(seq[0]), 0, 0);
+
+  var fps = 1000 / st.base;
+  var stream = cv.captureStream(Math.max(1, Math.round(fps)));
+  var rec;
+  try {
+    rec = new MediaRecorder(stream, {
+      mimeType: mime,
+      videoBitsPerSecond: Math.min(12e6, Math.max(8e5, Math.round(st.w * st.h * fps * 0.14)))
+    });
+  } catch (e) {
+    showErr('녹화기 초기화 실패: ' + e.message);
+    b1.disabled = b2.disabled = false; $('prog2').hidden = true;
+    return;
+  }
+  var chunks = [];
+  rec.ondataavailable = function (e) { if (e.data && e.data.size) chunks.push(e.data); };
+  rec.onerror = function (e) {
+    showErr('녹화 실패: ' + ((e.error && e.error.message) || 'unknown'));
+    b1.disabled = b2.disabled = false; $('prog2').hidden = true;
+  };
+  rec.onstop = function () {
+    var blob = new Blob(chunks, { type: mime });
+    var ext = mime.indexOf('mp4') >= 0 ? 'mp4' : 'webm';
+    $('prog2').hidden = true;
+    b1.disabled = b2.disabled = false;
+    st.sizes[ext.toUpperCase()] = blob.size; renderChips();
+    $('outNote').textContent = ext.toUpperCase() + ' ' + fmtB(blob.size) +
+      ' ' + doneWord() + '. GIF보다 훨씬 작지만, 자동 반복 재생은 보는 쪽 플레이어에 따라 다릅니다.' + saveHint();
+    offerResult(blob, outName(ext));
+  };
+
+  rec.start();
+  var t0 = performance.now(), k = 0, acc = 0;
+  /* 프레임이 압축 저장이라 그릴 때마다 디코딩해야 한다. 다음 프레임을 미리
+     디코딩해 두고, 타이밍은 누적 delay 기준으로 맞춘다. */
+  (async function step() {
+    if (k >= total) {
+      setTimeout(function () { try { rec.stop(); } catch (e) { /* 무시 */ } }, st.base + 80);
+      return;
+    }
+    var fi = seq[k % seq.length];
+    var f = st.frames[fi];
+    try {
+      ctx.drawImage(await frameBitmap(fi), 0, 0);
+    } catch (e) { /* 무시 */ }
+    if (k + 1 < total) frameBitmap(seq[(k + 1) % seq.length]).catch(function () { });
+    k++; acc += f.delay;
+    setProg('prog2', k / total, '동영상 녹화 ' + k + ' / ' + total);
+    setTimeout(step, Math.max(0, t0 + acc - performance.now()));
+  })();
+}
+
+/* ---------- 시작 ---------- */
+loadSettings();
+/* 지원 현황을 화면에 직접 띄운다. 비활성 버튼에 title 툴팁만 달면
+   폰에서는 hover 가 없어 이유를 볼 방법이 아예 없다. */
+(function showSupport() {
+  var vm = pickMime();
+  var vLabel = vm ? (vm.indexOf('mp4') >= 0 ? 'MP4' : 'WebM') : null;
+  var webpLabel = WEBP_NATIVE ? '✓' : (WEBP_WASM ? '✓ 내장 libwebp' : '✗');
+  var line = '이 브라우저 지원 — GIF ✓ · WebP ' + webpLabel +
+    ' · 동영상 ' + (vLabel ? '✓ ' + vLabel : '✗');
+  var extra = '';
+  if (!WEBP_NATIVE && WEBP_WASM) {
+    extra = '<br>이 브라우저에는 캔버스 WebP 인코더가 없어(Safari 계열) 파일에 내장된 ' +
+      'libwebp(wasm)로 만듭니다. 결과는 같고, 프레임당 인코딩이 조금 더 느립니다.';
+  } else if (!WEBP_OK) {
+    $('btnWebp').disabled = true;
+    $('btnWebp').title = '이 브라우저에는 WebP 인코더가 없습니다';
+    extra = '<br><span class="warn">WebP 저장을 쓸 수 없습니다.' +
+      (vLabel ? ' <b>동영상으로 저장</b>(' + vLabel + ')을 쓰시면 용량이 WebP와 비슷합니다.' : '') +
+      '</span>';
+  }
+  if (!vLabel) {
+    $('btnVid').disabled = true;
+    $('btnVid').title = '이 브라우저는 MediaRecorder를 지원하지 않습니다';
+  }
+  $('supNote').innerHTML = line + extra;
+})();
+window.addEventListener('beforeunload', function () { if (st.url) URL.revokeObjectURL(st.url); });
+
+if (opts.compact) $('appHead').hidden = true;
+
+/* 호스트(갤러리)가 결과를 직접 받아쓰는 모드 */
+$('btnAttach').addEventListener('click', function () {
+  if (!lastOut || !onAttach) return;
+  onAttach({ blob: lastOut.blob, name: lastOut.name, mime: lastOut.blob.type });
+});
+
+return {
+  /* 호스트에서 다시 열 때 이전 결과 흔적을 지운다 */
+  reset: function () {
+    stopPreview();
+    clearFrameCache();
+    st.frames = []; st.cache = {}; lastOut = null;
+    if (st.url) { URL.revokeObjectURL(st.url); st.url = null; }
+    $('outActions').hidden = true;
+    $('resultCard').hidden = true;
+    $('editor').hidden = true;
+    showErr('');
+    $('outNote').textContent = '';
+  },
+  stopPreview: stopPreview
+};
+}

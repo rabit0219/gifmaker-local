@@ -97,3 +97,23 @@ iOS는 저장 시 파일이 새 탭에서 열릴 수 있어 길게 눌러 [사�
 
 - [gifenc](https://github.com/mattdesl/gifenc) 1.0.3 — MIT, Matt DesLauriers
 - [libwebp](https://chromium.googlesource.com/webm/libwebp) (`webp_enc.wasm`, [@jsquash/webp](https://github.com/jamsinclair/jSquash) 1.5.0 빌드) — BSD-3-Clause, Google Inc.
+
+## 빌드
+
+`index.html` 은 `src/` 의 조각들을 이어붙여 만듭니다. `part-wasm.js` 가 414KB(libwebp base64)라
+한 파일로 두면 편집이 힘들어서 나눠 뒀습니다.
+
+```
+node src/build.js          # src/* -> index.html
+node src/build-module.js   # src/* -> dc-board-local/index.html 의 움짤 모듈 갱신
+node src/test-gif.js       # GIF 인코딩 · 크롭 · 배속 · 메모리 예산 검사
+node src/test-webp.js      # 애니메이션 WebP 컨테이너 구조 검사
+```
+
+`build-module.js` 는 [로컬 갤러리](https://github.com/rabit0219/local-inside) 의 `index.html` 안
+`GIFMAKER:BEGIN`/`END` 마커 사이만 교체합니다. 움짤 메이커를 고친 뒤 이 스크립트를 다시 돌리면
+갤러리에도 그대로 반영됩니다 (손으로 복붙하지 않습니다).
+
+갤러리에서는 CSS·ID 충돌을 막기 위해 움짤 UI 전체를 **shadow DOM** 안에서 돌립니다.
+그래서 `gmInit(root, opts)` 가 DOM 조회를 `root` 로만 합니다 — 단독 페이지는 `document`,
+갤러리는 `shadowRoot`.

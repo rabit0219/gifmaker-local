@@ -1,1 +1,3 @@
 .gstack/
+src/out-*.gif
+src/out-*.webp

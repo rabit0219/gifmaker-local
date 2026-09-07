@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>움짤 메이커</title>
+<style>
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: #14161a; color: #e6e8ec;
+  font: 14px/1.5 "Malgun Gothic", -apple-system, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+.wrap { max-width: 900px; margin: 0 auto; padding: 20px 16px 60px; }
+h1 { font-size: 20px; margin: 8px 0 2px; letter-spacing: -.3px; }
+h1 span { color: #4c8dff; }
+.sub { color: #767d8a; font-size: 12.5px; margin-bottom: 20px; }
+.card { background: #1c1f26; border: 1px solid #262a33; border-radius: 12px; padding: 16px; margin-bottom: 14px; }
+.card h2 { font-size: 13px; margin: 0 0 12px; color: #a8b0bd; font-weight: 600; letter-spacing: .2px; }
+.card h2 em { font-style: normal; color: #6b7280; font-weight: 400; margin-left: 6px; }
+[hidden] { display: none !important; }
+
+#drop {
+  border: 2px dashed #333a45; border-radius: 12px; padding: 44px 20px; text-align: center;
+  cursor: pointer; transition: .15s; background: #1a1d23;
+}
+#drop:hover, #drop.over { border-color: #4c8dff; background: #1e242e; }
+#drop svg { opacity: .5; margin-bottom: 10px; }
+#drop b { display: block; font-size: 15px; margin-bottom: 4px; }
+#drop small { color: #767d8a; }
+
+/* ---- 비디오 + 크롭 오버레이 ---- */
+.vid-box { background: #000; border-radius: 8px; text-align: center; padding: 0; overflow: hidden; }
+#stage { position: relative; display: inline-block; line-height: 0; max-width: 100%; overflow: hidden; }
+video { max-width: 100%; max-height: 320px; display: block; }
+#cropBox {
+  position: absolute; border: 1px solid rgba(255,255,255,.95); cursor: move;
+  box-shadow: 0 0 0 9999px rgba(0,0,0,.55); touch-action: none;
+}
+#cropBox.off { display: none; }
+#cropBox::before, #cropBox::after {
+  content: ''; position: absolute; pointer-events: none; opacity: .35;
+  border-color: #fff; border-style: solid; border-width: 0;
+}
+#cropBox::before { left: 33.33%; right: 33.33%; top: 0; bottom: 0; border-left-width: 1px; border-right-width: 1px; }
+#cropBox::after { top: 33.33%; bottom: 33.33%; left: 0; right: 0; border-top-width: 1px; border-bottom-width: 1px; }
+.hd {
+  --hs: 14px; --ho: calc(var(--hs) / -2);
+  position: absolute; width: var(--hs); height: var(--hs);
+  background: #4c8dff; border: 2px solid #fff; border-radius: 3px; touch-action: none;
+}
+.hd[data-h=nw] { left: var(--ho); top: var(--ho); cursor: nwse-resize; }
+.hd[data-h=ne] { right: var(--ho); top: var(--ho); cursor: nesw-resize; }
+.hd[data-h=sw] { left: var(--ho); bottom: var(--ho); cursor: nesw-resize; }
+.hd[data-h=se] { right: var(--ho); bottom: var(--ho); cursor: nwse-resize; }
+.hd[data-h=n] { left: 50%; margin-left: var(--ho); top: var(--ho); cursor: ns-resize; }
+.hd[data-h=s] { left: 50%; margin-left: var(--ho); bottom: var(--ho); cursor: ns-resize; }
+.hd[data-h=w] { top: 50%; margin-top: var(--ho); left: var(--ho); cursor: ew-resize; }
+.hd[data-h=e] { top: 50%; margin-top: var(--ho); right: var(--ho); cursor: ew-resize; }
+/* 손가락용 히트 영역 확대 */
+@media (pointer: coarse) {
+  .hd { --hs: 26px; border-width: 3px; border-radius: 5px; }
+  .seg button { padding: 9px 4px; }
+  .btn.tiny { padding: 9px 14px; }
+  .range-wrap input[type=range]::-webkit-slider-thumb { width: 20px; height: 30px; margin-top: 2px; }
+  .range-wrap input[type=range]::-moz-range-thumb { width: 18px; height: 28px; }
+}
+.crop-info { position: absolute; left: 0; top: -1px; transform: translateY(-100%);
+  background: rgba(0,0,0,.75); color: #fff; font-size: 11px; padding: 2px 6px; border-radius: 4px;
+  white-space: nowrap; line-height: 1.5; pointer-events: none; }
+
+.meta { display: flex; gap: 14px; flex-wrap: wrap; color: #767d8a; font-size: 12px; margin-top: 10px; }
+.meta b { color: #c3c9d4; font-weight: 600; }
+
+.range-wrap { position: relative; height: 34px; margin: 18px 2px 4px; }
+.range-track { position: absolute; left: 0; right: 0; top: 14px; height: 6px; border-radius: 3px; background: #2f3540; }
+.range-sel { position: absolute; top: 14px; height: 6px; background: #4c8dff; border-radius: 3px; }
+.range-wrap input[type=range] {
+  position: absolute; left: 0; top: 0; width: 100%; height: 34px; margin: 0;
+  background: none; -webkit-appearance: none; appearance: none; pointer-events: none;
+}
+.range-wrap input[type=range]:focus { outline: none; }
+.range-wrap input[type=range]::-webkit-slider-runnable-track { background: none; height: 34px; }
+.range-wrap input[type=range]::-webkit-slider-thumb {
+  -webkit-appearance: none; pointer-events: auto; width: 14px; height: 26px; margin-top: 4px;
+  border-radius: 5px; background: #4c8dff; border: 2px solid #fff; cursor: ew-resize;
+}
+.range-wrap input[type=range]::-moz-range-track { background: none; height: 34px; }
+.range-wrap input[type=range]::-moz-range-thumb {
+  pointer-events: auto; width: 12px; height: 24px; border-radius: 5px;
+  background: #4c8dff; border: 2px solid #fff; cursor: ew-resize;
+}
+.trim-labels { display: flex; justify-content: space-between; font-size: 12px; color: #a8b0bd; }
+.trim-labels b { color: #4c8dff; font-variant-numeric: tabular-nums; }
+
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; }
+label.f { display: block; }
+label.f > span { display: block; font-size: 11.5px; color: #767d8a; margin-bottom: 5px; }
+select {
+  width: 100%; background: #14171d; color: #e6e8ec; border: 1px solid #333a45;
+  border-radius: 7px; padding: 8px 9px; font: inherit; font-size: 13px;
+}
+select:focus { outline: none; border-color: #4c8dff; }
+
+.seg { display: flex; background: #14171d; border: 1px solid #333a45; border-radius: 7px; padding: 3px; gap: 3px; flex-wrap: wrap; }
+.seg button {
+  flex: 1; background: none; border: 0; color: #98a0ad; padding: 6px 4px; border-radius: 5px;
+  font: inherit; font-size: 12.5px; cursor: pointer; transition: .12s; white-space: nowrap;
+}
+.seg button.on { background: #4c8dff; color: #fff; font-weight: 600; }
+.seg button:hover:not(.on) { color: #e6e8ec; }
+.seg.small button { font-size: 12px; padding: 5px 3px; }
+
+.est { margin-top: 12px; font-size: 12px; color: #767d8a; }
+.est b { color: #c3c9d4; }
+.warn { color: #ffb454; }
+
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 7px;
+  background: #4c8dff; color: #fff; border: 0; border-radius: 8px; padding: 11px 18px;
+  font: inherit; font-size: 14px; font-weight: 600; cursor: pointer; transition: .12s;
+}
+.btn:hover { background: #3d7ceb; }
+.btn:disabled { background: #2c313a; color: #6b7280; cursor: default; }
+.btn.ghost { background: #262b34; color: #c3c9d4; }
+.btn.ghost:hover { background: #303643; }
+.btn.wide { width: 100%; }
+.btn.tiny { padding: 6px 11px; font-size: 12px; font-weight: 500; }
+.row { display: flex; gap: 10px; flex-wrap: wrap; }
+.row > .btn { flex: 1; min-width: 140px; }
+
+.prog { margin-top: 14px; }
+.prog-bar { height: 6px; background: #2f3540; border-radius: 3px; overflow: hidden; }
+.prog-bar i { display: block; height: 100%; background: #4c8dff; width: 0; transition: width .12s; }
+.prog-txt { font-size: 12px; color: #a8b0bd; margin-top: 7px; font-variant-numeric: tabular-nums; }
+
+.result-box { background: #0d0f13; border-radius: 8px; padding: 14px; text-align: center; }
+#preview { max-width: 100%; border-radius: 4px; background: #000; }
+.chips { display: flex; gap: 8px; flex-wrap: wrap; margin: 12px 0 0; justify-content: center; }
+.chip { background: #22262f; border-radius: 20px; padding: 5px 12px; font-size: 12px; color: #a8b0bd; }
+.chip b { color: #e6e8ec; }
+.note { font-size: 11.5px; color: #6b7280; margin-top: 12px; line-height: 1.6; }
+#outActions { margin-top: 16px; padding-top: 14px; border-top: 1px solid #262a33; }
+.done-file { font-size: 13px; color: #a8b0bd; margin-bottom: 10px; text-align: center; }
+.done-file b { color: #e6e8ec; }
+.done-file .ok { color: #4ade80; margin-right: 5px; }
+.err { color: #ff6b6b; font-size: 12.5px; margin-top: 10px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div id="appHead">
+    <h1>움짤 <span>메이커</span></h1>
+    <p class="sub">동영상을 잘라 GIF·동영상 움짤로. 업로드 없이 브라우저 안에서만 처리됩니다.</p>
+  </div>
+
+  <div id="drop">
+    <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="#e6e8ec" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
+    </svg>
+    <b>동영상 파일을 여기로 끌어다 놓기</b>
+    <small>또는 클릭해서 선택 &nbsp;·&nbsp; mp4 / webm / mov</small>
+    <input type="file" id="file" accept="video/*" hidden>
+  </div>
+
+  <div id="editor" hidden>
+    <div class="card">
+      <h2>1. 구간 &amp; 크롭</h2>
+      <div class="vid-box">
+        <div id="stage">
+          <video id="video" muted playsinline preload="auto"></video>
+          <div id="cropBox" class="off">
+            <div class="crop-info" id="cropInfo"></div>
+            <div class="hd" data-h="nw"></div><div class="hd" data-h="n"></div><div class="hd" data-h="ne"></div>
+            <div class="hd" data-h="w"></div><div class="hd" data-h="e"></div>
+            <div class="hd" data-h="sw"></div><div class="hd" data-h="s"></div><div class="hd" data-h="se"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="range-wrap">
+        <div class="range-track"></div><div class="range-sel" id="rsel"></div>
+        <input type="range" id="rStart" min="0" max="100" step="0.01" value="0">
+        <input type="range" id="rEnd" min="0" max="100" step="0.01" value="100">
+      </div>
+      <div class="trim-labels">
+        <span>시작 <b id="lStart">0.00s</b></span>
+        <span>길이 <b id="lDur">0.00s</b></span>
+        <span>끝 <b id="lEnd">0.00s</b></span>
+      </div>
+
+      <div style="margin-top:16px">
+        <label class="f"><span>크롭 비율</span>
+          <div class="seg small" id="segCrop">
+            <button data-v="off" class="on">끄기</button>
+            <button data-v="free">자유</button>
+            <button data-v="1:1">1:1</button>
+            <button data-v="4:5">4:5</button>
+            <button data-v="9:16">9:16</button>
+            <button data-v="16:9">16:9</button>
+            <button data-v="3:4">3:4</button>
+          </div>
+        </label>
+        <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn ghost tiny" id="btnCropFull">전체 선택</button>
+          <button class="btn ghost tiny" id="btnCropCenter">가운데 맞춤</button>
+        </div>
+      </div>
+      <div class="meta" id="vmeta"></div>
+    </div>
+
+    <div class="card">
+      <h2>2. 설정</h2>
+      <div class="grid">
+        <label class="f"><span>모드</span>
+          <div class="seg" id="segMode">
+            <button data-v="normal" class="on">일반</button>
+            <button data-v="boomerang">부메랑</button>
+          </div>
+        </label>
+        <label class="f"><span>재생 배속</span>
+          <select id="selSpeed">
+            <option value="0.25">0.25x (아주 느리게)</option>
+            <option value="0.5">0.5x (느리게)</option>
+            <option value="1" selected>1.0x (원본)</option>
+            <option value="1.5">1.5x</option>
+            <option value="2">2.0x</option>
+            <option value="3">3.0x</option>
+            <option value="5">5.0x (아주 빠르게)</option>
+          </select>
+        </label>
+        <label class="f"><span>가로 크기</span>
+          <select id="selW">
+            <option value="240">240px</option>
+            <option value="320">320px</option>
+            <option value="480" selected>480px</option>
+            <option value="640">640px</option>
+            <option value="0">원본(크롭) 크기</option>
+          </select>
+        </label>
+        <label class="f"><span>초당 프레임</span>
+          <select id="selFps">
+            <option value="8">8 fps</option>
+            <option value="10">10 fps</option>
+            <option value="12">12 fps</option>
+            <option value="15" selected>15 fps</option>
+            <option value="20">20 fps</option>
+            <option value="25">25 fps</option>
+          </select>
+        </label>
+        <label class="f"><span>색상 수 (GIF)</span>
+          <select id="selColors">
+            <option value="64">64색 (작게)</option>
+            <option value="128">128색</option>
+            <option value="256" selected>256색 (최상)</option>
+          </select>
+        </label>
+        <label class="f"><span>디더링 (GIF)</span>
+          <select id="selDither">
+            <option value="fs" selected>Floyd-Steinberg</option>
+            <option value="bayer">Bayer</option>
+            <option value="none">없음</option>
+          </select>
+        </label>
+        <label class="f"><span>화질 (WebP)</span>
+          <select id="selWq">
+            <option value="0.6">60% (아주 작게)</option>
+            <option value="0.75">75%</option>
+            <option value="0.85" selected>85% (권장)</option>
+            <option value="0.95">95% (고화질)</option>
+          </select>
+        </label>
+      </div>
+      <div class="est" id="est"></div>
+      <div class="prog" id="prog" hidden>
+        <div class="prog-bar"><i id="progBar"></i></div>
+        <div class="prog-txt" id="progTxt"></div>
+      </div>
+      <div style="margin-top:14px" class="row">
+        <button class="btn" id="btnMake" style="flex:3">움짤 만들기</button>
+        <button class="btn ghost" id="btnCancel" style="flex:1;min-width:100px" hidden>취소</button>
+      </div>
+      <div class="err" id="err" hidden></div>
+    </div>
+
+    <div class="card" id="resultCard" hidden>
+      <h2>3. 결과 <em id="resHint"></em></h2>
+      <div class="result-box">
+        <canvas id="preview"></canvas>
+        <div class="chips" id="chips"></div>
+      </div>
+      <div style="margin:14px 0 0">
+        <div class="seg" id="segMode2" style="max-width:260px;margin:0 auto 14px">
+          <button data-v="normal" class="on">일반 재생</button>
+          <button data-v="boomerang">부메랑 재생</button>
+        </div>
+        <div class="row">
+          <button class="btn" id="btnWebp">WebP로 저장</button>
+          <button class="btn ghost" id="btnGif">GIF로 저장</button>
+          <button class="btn ghost" id="btnVid">동영상으로 저장</button>
+        </div>
+        <p class="note" style="margin-top:10px">
+          <b style="color:#a8b0bd">WebP</b>가 대체로 가장 작고 (GIF의 1/3~1/10), 이미지라서 GIF처럼 그대로 붙습니다.
+          <b style="color:#a8b0bd">GIF</b>는 호환성이 필요할 때 (카톡·구형 커뮤니티).
+          움직임이 많고 긴 영상은 <b style="color:#a8b0bd">동영상</b>이 더 작을 수 있으니, 저장해 보고 위 용량을 비교하세요.
+        </p>
+        <p class="note" id="supNote" style="margin-top:6px"></p>
+      </div>
+      <div class="prog" id="prog2" hidden>
+        <div class="prog-bar"><i id="progBar2"></i></div>
+        <div class="prog-txt" id="progTxt2"></div>
+      </div>
+
+      <div id="outActions" hidden>
+        <div class="done-file" id="outFile"></div>
+        <div class="row">
+          <button class="btn" id="btnAttach" hidden>게시물에 첨부</button>
+          <button class="btn" id="btnShare" hidden>
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8"/><polyline points="16 6 12 2 8 6"/><line x1="12" y1="2" x2="12" y2="15"/>
+            </svg>
+            앨범에 저장 · 공유
+          </button>
+          <button class="btn ghost" id="btnDl">파일로 저장</button>
+          <button class="btn ghost" id="btnSaveAs" hidden>위치 선택해 저장</button>
+        </div>
+        <p class="note" id="shareHint"></p>
+      </div>
+
+      <p class="note" id="outNote"></p>
+    </div>
+  </div>
+</div>
+
+<script>
+/* ---------- gifenc 1.0.3 (MIT, Matt DesLauriers) - inlined bundle ---------- */
+var gifenc = (function () { var exports = {};
